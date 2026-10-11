@@ -4,8 +4,10 @@ name: build-bcm2836sdhc
 # for ARM64 with the patches in ./patches applied, signs it with a throw-away
 # test certificate and uploads the result as an artifact.
 #
-# NOTE: first draft. Windows driver builds on hosted runners are fiddly; if a step
-# fails, send me the log tail of that step and I will fix the workflow.
+# Toolchain: Visual Studio 2022 (on the runner) + Windows SDK/WDK MSI installers for
+# Windows 11 25H2 (build 26100.6584) -- the kit Microsoft lists as the supported one for
+# VS 2022: https://learn.microsoft.com/windows-hardware/drivers/other-wdk-downloads
+# No NuGet.
 
 on:
   workflow_dispatch:
@@ -18,8 +20,10 @@ on:
 env:
   # raspberrypi/windows-drivers commit the patches were written against
   UPSTREAM_SHA: 88ee238c9debecce810d208cac1e5f36add3d2a1
-  # WDK NuGet version that targets VS 2022 / MSBuild 17 (28000.x targets VS 2026)
-  WDK_NUGET_VERSION: 10.0.26100.2454
+  # Microsoft download links (Learn: "Supported WDK versions", Windows 11 25H2, 26100.6584)
+  SDK_URL: https://go.microsoft.com/fwlink/?linkid=2338977
+  WDK_URL: https://go.microsoft.com/fwlink/?linkid=2335869
+  KIT_BUILD: 10.0.26100.0
   CONFIG: Release
   PLATFORM: ARM64
 
@@ -47,73 +51,50 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "patch failed: $($_.Name)" }
           }
 
-      - name: Restore WDK NuGet packages (pinned version)
-        shell: pwsh
+      - name: Inspect runner (VS, kits)
         run: |
-          $v = $env:WDK_NUGET_VERSION
-          $pkgs = @'
-          <?xml version="1.0" encoding="utf-8"?>
-          <packages>
-          <package id="Microsoft.Windows.SDK.CPP" version="__V__" targetFramework="native" />
-          <package id="Microsoft.Windows.SDK.CPP.x64" version="__V__" targetFramework="native" />
-          <package id="Microsoft.Windows.SDK.CPP.arm64" version="__V__" targetFramework="native" />
-          <package id="Microsoft.Windows.WDK.x64" version="__V__" targetFramework="native" />
-          <package id="Microsoft.Windows.WDK.arm64" version="__V__" targetFramework="native" />
-          </packages>
-          '@
-          $pkgs.Replace('__V__', $v) | Set-Content -Encoding utf8 packages.config
+          $vsw = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vsw -latest -products * -property installationPath
+          $ver = & $vsw -latest -products * -property installationVersion
+          $inc = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
+          $kits = if (Test-Path $inc) { (Get-ChildItem $inc -Directory).Name -join ', ' } else { 'none' }
+          $arm = Test-Path "$vs\VC\Tools\MSVC"
+          $tc = Test-Path "$vs\MSBuild\Microsoft\VC\v170\Platforms\ARM64\PlatformToolsets\WindowsKernelModeDriver10.0"
+          Write-Host "::notice title=runner::VS=$ver at $vs | kits: $kits | WDK toolset present: $tc"
 
-          $props = @'
-          <Project>
-          <Import Project="packages\Microsoft.Windows.WDK.x64.__V__\build\native\Microsoft.Windows.WDK.x64.props" Condition="Exists('packages\Microsoft.Windows.WDK.x64.__V__\build\native\Microsoft.Windows.WDK.x64.props')" />
-          <Import Project="packages\Microsoft.Windows.WDK.arm64.__V__\build\native\Microsoft.Windows.WDK.arm64.props" Condition="Exists('packages\Microsoft.Windows.WDK.arm64.__V__\build\native\Microsoft.Windows.WDK.arm64.props')" />
-          <Import Project="packages\Microsoft.Windows.SDK.CPP.x64.__V__\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.x64.__V__\build\native\Microsoft.Windows.SDK.cpp.x64.props')" />
-          <Import Project="packages\Microsoft.Windows.SDK.CPP.arm64.__V__\build\native\Microsoft.Windows.SDK.cpp.arm64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.arm64.__V__\build\native\Microsoft.Windows.SDK.cpp.arm64.props')" />
-          <Import Project="packages\Microsoft.Windows.SDK.CPP.__V__\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.__V__\build\native\Microsoft.Windows.SDK.cpp.props')" />
-          </Project>
-          '@
-          $props.Replace('__V__', $v) | Set-Content -Encoding utf8 upstream\Directory.Build.props
-
-          nuget restore packages.config -PackagesDirectory upstream\packages\
-          if ($LASTEXITCODE -ne 0) { throw "nuget restore failed" }
-
-          $dlls = Get-ChildItem upstream\packages -Recurse -Filter 'Microsoft.DriverKit.Build.Tasks*.dll' |
-                  ForEach-Object { $_.Name } | Sort-Object -Unique
-          Write-Host "::notice title=wdk-task-dlls::$($dlls -join ' | ')"
-
-      - name: Add WDK NuGet tool folders to PATH
-        shell: pwsh
+      - name: Install Windows SDK 26100 (if missing)
         run: |
-          $root = (Resolve-Path upstream\packages).Path
-          $tools = @(
-            'stampinf.exe',
-            'tracewpp.exe',
-            'Inf2Cat.exe',
-            'signtool.exe',
-            'infverif.exe',
-            'ApiValidator.exe'
-          )
+          $inc = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\$env:KIT_BUILD\um\windows.h"
+          if (Test-Path $inc) { Write-Host "SDK $env:KIT_BUILD already installed"; exit 0 }
+          Invoke-WebRequest $env:SDK_URL -OutFile winsdksetup.exe
+          $p = Start-Process -FilePath .\winsdksetup.exe -Wait -PassThru -ArgumentList '/quiet','/norestart','/features','OptionId.DesktopCPPx64','OptionId.DesktopCPParm64','OptionId.DesktopCPPx86'
+          Write-Host "SDK installer exit code: $($p.ExitCode)"
+          if ($p.ExitCode -notin 0,3010) { throw "SDK install failed" }
 
-          $all = Get-ChildItem $root -Recurse -Include $tools -ErrorAction SilentlyContinue
-          Write-Host "::notice title=wdk-tools::$(($all | ForEach-Object { $_.FullName.Replace($root + '\','') }) -join ' | ')"
+      - name: Install WDK 26100 (MSI installer)
+        run: |
+          Invoke-WebRequest $env:WDK_URL -OutFile wdksetup.exe
+          $p = Start-Process -FilePath .\wdksetup.exe -Wait -PassThru -ArgumentList '/quiet','/norestart'
+          Write-Host "WDK installer exit code: $($p.ExitCode)"
+          if ($p.ExitCode -notin 0,3010) { throw "WDK install failed" }
+          $km = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\$env:KIT_BUILD\km\ntddk.h"
+          if (-not (Test-Path $km)) { throw "WDK km headers missing after install" }
 
-          foreach ($t in $tools) {
-            $c = @($all | Where-Object Name -eq $t)
-
-            # These validation tools are x86-only; prefer x86 explicitly.
-            if ($t -in @('infverif.exe','ApiValidator.exe')) {
-              $pick = $c | Where-Object FullName -match '\\x86\\' | Select-Object -First 1
-            } else {
-              $pick = $c | Where-Object FullName -match '\\x64\\' | Select-Object -First 1
-              if (-not $pick) { $pick = $c | Where-Object FullName -match '\\x86\\' | Select-Object -First 1 }
-            }
-
-            if (-not $pick) { $pick = $c | Select-Object -First 1 }
-            if ($pick) {
-              Add-Content $env:GITHUB_PATH $pick.DirectoryName
-              Write-Host "Added to PATH: $($pick.DirectoryName)"
-            }
-          }
+      - name: Make sure the WDK Visual Studio extension (toolset) is installed
+        run: |
+          $vsw = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vsw -latest -products * -property installationPath
+          $ts = "$vs\MSBuild\Microsoft\VC\v170\Platforms\ARM64\PlatformToolsets\WindowsKernelModeDriver10.0"
+          if (Test-Path $ts) { Write-Host "WDK toolset already registered"; exit 0 }
+          $vsix = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Vsix" -Recurse -Filter WDK.vsix -ErrorAction SilentlyContinue |
+                  Where-Object FullName -match 'VS2022' | Sort-Object FullName | Select-Object -Last 1
+          if (-not $vsix) { throw "WDK.vsix not found" }
+          Write-Host "Installing $($vsix.FullName)"
+          $inst = & $vsw -latest -products * -property productPath
+          $vsixInstaller = Join-Path (Split-Path $inst) 'VSIXInstaller.exe'
+          $p = Start-Process -FilePath $vsixInstaller -Wait -PassThru -ArgumentList '/quiet','/admin',"`"$($vsix.FullName)`""
+          Write-Host "VSIXInstaller exit code: $($p.ExitCode)"
+          if (-not (Test-Path $ts)) { throw "WDK toolset still missing after VSIX install" }
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
@@ -124,6 +105,7 @@ jobs:
           $sol = (Resolve-Path upstream\build\bcm2836).Path + '\'
           msbuild upstream\drivers\sd\bcm2836\bcm2836sdhc\bcm2836sdhc.vcxproj `
             /p:Configuration=$env:CONFIG /p:Platform=$env:PLATFORM `
+            /p:WindowsTargetPlatformVersion=$env:KIT_BUILD `
             /p:SolutionDir=$sol /p:SignMode=Off /p:EnableInf2cat=false `
             /p:TreatWarningAsError=false /p:RunCodeAnalysis=false `
             /v:m /bl:build.binlog `
@@ -139,10 +121,6 @@ jobs:
             $t = $text -replace '%','%25' -replace "`r",'' -replace "`n",'%0A'
             Write-Host "::error title=$title::$t"
           }
-
-          $pk = (Get-ChildItem upstream\packages -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ', '
-          Emit 'packages' $pk
-
           if (Test-Path errors.log) {
             $e = Get-Content errors.log -Raw
             if ($e.Length -gt 3800) { $e = $e.Substring(0,3800) }
@@ -177,27 +155,19 @@ jobs:
             -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(30)
 
           Export-Certificate -Cert $cert -FilePath dist\rpi_win_ci_signing.cer | Out-Null
-
-          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
-          $signtool = Get-ChildItem $kits -Recurse -Filter signtool.exe |
-            Where-Object FullName -match '\\x64\\' | Sort-Object FullName | Select-Object -Last 1
-
-          $inf2cat = Get-ChildItem upstream\packages,$kits -Recurse -Filter Inf2Cat.exe `
-            -ErrorAction SilentlyContinue | Select-Object -First 1
-
-          if (-not $signtool -or -not $inf2cat) { throw "signtool/Inf2Cat not found" }
-
-          & $signtool.FullName sign /fd SHA256 /sha1 $cert.Thumbprint dist\bcm2836sdhc.sys
-
+          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\$env:KIT_BUILD"
+          $signtool = "$kits\x64\signtool.exe"
+          $inf2cat = "$kits\x86\Inf2Cat.exe"
+          if (-not (Test-Path $signtool) -or -not (Test-Path $inf2cat)) { throw "signtool/Inf2Cat not found in $kits" }
+          & $signtool sign /fd SHA256 /sha1 $cert.Thumbprint dist\bcm2836sdhc.sys
           $ok = $false
           foreach ($os in '10_NI_ARM64','10_CO_ARM64','10_RS5_ARM64') {
-            & $inf2cat.FullName /driver:dist /os:$os
+            & $inf2cat /driver:dist /os:$os
             if ($LASTEXITCODE -eq 0) { $ok = $true; Write-Host "catalog OK for $os"; break }
           }
 
           if (-not $ok) { throw "Inf2Cat failed for all OS tokens" }
-
-          & $signtool.FullName sign /fd SHA256 /sha1 $cert.Thumbprint dist\bcm2836sdhc.cat
+          & $signtool sign /fd SHA256 /sha1 $cert.Thumbprint dist\bcm2836sdhc.cat
 
       - name: Upload driver package
         uses: actions/upload-artifact@v4
