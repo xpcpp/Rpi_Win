@@ -76,6 +76,20 @@ jobs:
                   ForEach-Object { $_.Name } | Sort-Object -Unique
           Write-Host "::notice title=wdk-task-dlls::$($dlls -join ' | ')"
 
+      - name: Add WDK NuGet tool folders to PATH
+        run: |
+          $root = (Resolve-Path upstream\packages).Path
+          $tools = 'stampinf.exe','tracewpp.exe','Inf2Cat.exe','signtool.exe','infverif.exe'
+          $all = Get-ChildItem $root -Recurse -Include $tools -ErrorAction SilentlyContinue
+          Write-Host "::notice title=wdk-tools::$(($all | ForEach-Object { $_.FullName.Replace($root + '\','') }) -join ' | ')"
+          foreach ($t in $tools) {
+            $c = $all | Where-Object Name -eq $t
+            $pick = ($c | Where-Object FullName -match '\\x64\\' | Select-Object -First 1)
+            if (-not $pick) { $pick = ($c | Where-Object FullName -match '\\x86\\' | Select-Object -First 1) }
+            if (-not $pick) { $pick = $c | Select-Object -First 1 }
+            if ($pick) { Add-Content $env:GITHUB_PATH $pick.DirectoryName }
+          }
+
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
