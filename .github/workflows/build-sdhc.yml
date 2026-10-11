@@ -70,7 +70,30 @@ jobs:
             /p:Configuration=$env:CONFIG /p:Platform=$env:PLATFORM `
             /p:SolutionDir=$sol /p:SignMode=Off /p:EnableInf2cat=false `
             /p:TreatWarningAsError=false /p:RunCodeAnalysis=false `
-            /v:m /bl:build.binlog
+            /v:m /bl:build.binlog `
+            "/flp1:logfile=errors.log;errorsonly;verbosity=quiet" `
+            "/flp2:logfile=full.log;verbosity=normal"
+          exit $LASTEXITCODE
+
+      - name: Report build errors as annotations
+        if: failure()
+        run: |
+          function Emit($title, $text) {
+            $t = $text -replace '%','%25' -replace "`r",'' -replace "`n",'%0A'
+            Write-Host "::error title=$title::$t"
+          }
+          $pk = (Get-ChildItem upstream\packages -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ', '
+          Emit 'packages' $pk
+          if (Test-Path errors.log) {
+            $e = Get-Content errors.log -Raw
+            if ($e.Length -gt 3800) { $e = $e.Substring(0,3800) }
+            Emit 'msbuild-errors' $e
+          }
+          if (Test-Path full.log) {
+            $l = (Get-Content full.log -Tail 45) -join "`n"
+            if ($l.Length -gt 3800) { $l = $l.Substring($l.Length-3800) }
+            Emit 'msbuild-tail' $l
+          }
 
       - name: Collect outputs
         run: |
