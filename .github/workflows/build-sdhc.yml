@@ -60,6 +60,20 @@ jobs:
           nuget restore wds\packages.config -PackagesDirectory upstream\packages\
           Copy-Item wds\Directory.Build.props upstream\Directory.Build.props
 
+      - name: Locate / repair WDK build-task DLL (arm64 package lacks it)
+        run: |
+          $found = Get-ChildItem upstream\packages -Recurse -Filter 'Microsoft.DriverKit.Build.Tasks*.dll' -ErrorAction SilentlyContinue
+          Write-Host "::notice title=wdk-dlls::$(($found | ForEach-Object { $_.FullName.Replace((Get-Location).Path + '\upstream\packages\','') }) -join ' | ')"
+          $arm = Get-ChildItem upstream\packages -Directory | Where-Object Name -like 'Microsoft.Windows.WDK.ARM64.*' | Select-Object -First 1
+          $armBin = Join-Path $arm.FullName 'c\build\10.0.28000.0\bin'
+          if (-not (Test-Path (Join-Path $armBin 'Microsoft.DriverKit.Build.Tasks.17.0.dll'))) {
+            $src = $found | Where-Object FullName -like '*WDK.x64*' | Where-Object Name -eq 'Microsoft.DriverKit.Build.Tasks.17.0.dll' | Select-Object -First 1
+            if (-not $src) { throw "task DLL not found in any WDK package" }
+            New-Item -ItemType Directory -Force $armBin | Out-Null
+            Copy-Item (Join-Path $src.DirectoryName '*') $armBin -Recurse -Force
+            Write-Host "::notice title=wdk-dlls-fix::copied bin from $($src.DirectoryName)"
+          }
+
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
