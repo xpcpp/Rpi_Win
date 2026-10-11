@@ -39,6 +39,7 @@ jobs:
 
       - name: Apply patches
         working-directory: upstream
+        shell: pwsh
         run: |
           Get-ChildItem ..\patches\*.patch | Sort-Object Name | ForEach-Object {
             Write-Host "Applying $($_.Name)"
@@ -47,6 +48,7 @@ jobs:
           }
 
       - name: Restore WDK NuGet packages (pinned version)
+        shell: pwsh
         run: |
           $v = $env:WDK_NUGET_VERSION
           $pkgs = @'
@@ -60,40 +62,64 @@ jobs:
           </packages>
           '@
           $pkgs.Replace('__V__', $v) | Set-Content -Encoding utf8 packages.config
+
           $props = @'
           <Project>
-          <Import Project="packages\Microsoft.Windows.WDK.x64.__V__\build\native\Microsoft.Windows.WDK.x64.props" Condition="Exists('packages\Microsoft.Windows.WDK.x64.__V__\build\native\Microsoft.Windows.WDK.x64.props') and '$(Platform)' == 'x64'"/>
-          <Import Project="packages\Microsoft.Windows.WDK.arm64.__V__\build\native\Microsoft.Windows.WDK.arm64.props" Condition="Exists('packages\Microsoft.Windows.WDK.arm64.__V__\build\native\Microsoft.Windows.WDK.arm64.props') and '$(Platform)' == 'ARM64'"/>
-          <Import Project="packages\Microsoft.Windows.SDK.CPP.x64.__V__\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.x64.__V__\build\native\Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'"/>
-          <Import Project="packages\Microsoft.Windows.SDK.CPP.arm64.__V__\build\native\Microsoft.Windows.SDK.cpp.arm64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.arm64.__V__\build\native\Microsoft.Windows.SDK.cpp.arm64.props') and '$(Platform)' == 'ARM64'"/>
-          <Import Project="packages\Microsoft.Windows.SDK.CPP.__V__\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.__V__\build\native\Microsoft.Windows.SDK.cpp.props')"/>
+          <Import Project="packages\Microsoft.Windows.WDK.x64.__V__\build\native\Microsoft.Windows.WDK.x64.props" Condition="Exists('packages\Microsoft.Windows.WDK.x64.__V__\build\native\Microsoft.Windows.WDK.x64.props')" />
+          <Import Project="packages\Microsoft.Windows.WDK.arm64.__V__\build\native\Microsoft.Windows.WDK.arm64.props" Condition="Exists('packages\Microsoft.Windows.WDK.arm64.__V__\build\native\Microsoft.Windows.WDK.arm64.props')" />
+          <Import Project="packages\Microsoft.Windows.SDK.CPP.x64.__V__\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.x64.__V__\build\native\Microsoft.Windows.SDK.cpp.x64.props')" />
+          <Import Project="packages\Microsoft.Windows.SDK.CPP.arm64.__V__\build\native\Microsoft.Windows.SDK.cpp.arm64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.arm64.__V__\build\native\Microsoft.Windows.SDK.cpp.arm64.props')" />
+          <Import Project="packages\Microsoft.Windows.SDK.CPP.__V__\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.__V__\build\native\Microsoft.Windows.SDK.cpp.props')" />
           </Project>
           '@
           $props.Replace('__V__', $v) | Set-Content -Encoding utf8 upstream\Directory.Build.props
+
           nuget restore packages.config -PackagesDirectory upstream\packages\
           if ($LASTEXITCODE -ne 0) { throw "nuget restore failed" }
+
           $dlls = Get-ChildItem upstream\packages -Recurse -Filter 'Microsoft.DriverKit.Build.Tasks*.dll' |
                   ForEach-Object { $_.Name } | Sort-Object -Unique
           Write-Host "::notice title=wdk-task-dlls::$($dlls -join ' | ')"
 
       - name: Add WDK NuGet tool folders to PATH
+        shell: pwsh
         run: |
           $root = (Resolve-Path upstream\packages).Path
-          $tools = 'stampinf.exe','tracewpp.exe','Inf2Cat.exe','signtool.exe','infverif.exe'
+          $tools = @(
+            'stampinf.exe',
+            'tracewpp.exe',
+            'Inf2Cat.exe',
+            'signtool.exe',
+            'infverif.exe',
+            'ApiValidator.exe'
+          )
+
           $all = Get-ChildItem $root -Recurse -Include $tools -ErrorAction SilentlyContinue
           Write-Host "::notice title=wdk-tools::$(($all | ForEach-Object { $_.FullName.Replace($root + '\','') }) -join ' | ')"
+
           foreach ($t in $tools) {
-            $c = $all | Where-Object Name -eq $t
-            $pick = ($c | Where-Object FullName -match '\\x64\\' | Select-Object -First 1)
-            if (-not $pick) { $pick = ($c | Where-Object FullName -match '\\x86\\' | Select-Object -First 1) }
+            $c = @($all | Where-Object Name -eq $t)
+
+            # These validation tools are x86-only; prefer x86 explicitly.
+            if ($t -in @('infverif.exe','ApiValidator.exe')) {
+              $pick = $c | Where-Object FullName -match '\\x86\\' | Select-Object -First 1
+            } else {
+              $pick = $c | Where-Object FullName -match '\\x64\\' | Select-Object -First 1
+              if (-not $pick) { $pick = $c | Where-Object FullName -match '\\x86\\' | Select-Object -First 1 }
+            }
+
             if (-not $pick) { $pick = $c | Select-Object -First 1 }
-            if ($pick) { Add-Content $env:GITHUB_PATH $pick.DirectoryName }
+            if ($pick) {
+              Add-Content $env:GITHUB_PATH $pick.DirectoryName
+              Write-Host "Added to PATH: $($pick.DirectoryName)"
+            }
           }
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
       - name: Build bcm2836sdhc (ARM64)
+        shell: pwsh
         run: |
           $sol = (Resolve-Path upstream\build\bcm2836).Path + '\'
           msbuild upstream\drivers\sd\bcm2836\bcm2836sdhc\bcm2836sdhc.vcxproj `
@@ -107,18 +133,22 @@ jobs:
 
       - name: Report build errors as annotations
         if: failure()
+        shell: pwsh
         run: |
           function Emit($title, $text) {
             $t = $text -replace '%','%25' -replace "`r",'' -replace "`n",'%0A'
             Write-Host "::error title=$title::$t"
           }
+
           $pk = (Get-ChildItem upstream\packages -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name) -join ', '
           Emit 'packages' $pk
+
           if (Test-Path errors.log) {
             $e = Get-Content errors.log -Raw
             if ($e.Length -gt 3800) { $e = $e.Substring(0,3800) }
             Emit 'msbuild-errors' $e
           }
+
           if (Test-Path full.log) {
             $l = (Get-Content full.log -Tail 45) -join "`n"
             if ($l.Length -gt 3800) { $l = $l.Substring($l.Length-3800) }
@@ -126,6 +156,7 @@ jobs:
           }
 
       - name: Collect outputs
+        shell: pwsh
         run: |
           New-Item -ItemType Directory dist | Out-Null
           foreach ($n in 'bcm2836sdhc.sys','bcm2836sdhc.inf','bcm2836sdhc.pdb') {
@@ -138,25 +169,34 @@ jobs:
 
       - name: Sign (throw-away test certificate) and make catalog
         continue-on-error: true
+        shell: pwsh
         run: |
           $cert = New-SelfSignedCertificate -Type CodeSigningCert `
             -Subject "CN=Rpi_Win CI test signing run $env:GITHUB_RUN_ID" `
             -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
             -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(30)
+
           Export-Certificate -Cert $cert -FilePath dist\rpi_win_ci_signing.cer | Out-Null
+
           $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
           $signtool = Get-ChildItem $kits -Recurse -Filter signtool.exe |
             Where-Object FullName -match '\\x64\\' | Sort-Object FullName | Select-Object -Last 1
+
           $inf2cat = Get-ChildItem upstream\packages,$kits -Recurse -Filter Inf2Cat.exe `
             -ErrorAction SilentlyContinue | Select-Object -First 1
+
           if (-not $signtool -or -not $inf2cat) { throw "signtool/Inf2Cat not found" }
+
           & $signtool.FullName sign /fd SHA256 /sha1 $cert.Thumbprint dist\bcm2836sdhc.sys
+
           $ok = $false
           foreach ($os in '10_NI_ARM64','10_CO_ARM64','10_RS5_ARM64') {
             & $inf2cat.FullName /driver:dist /os:$os
             if ($LASTEXITCODE -eq 0) { $ok = $true; Write-Host "catalog OK for $os"; break }
           }
+
           if (-not $ok) { throw "Inf2Cat failed for all OS tokens" }
+
           & $signtool.FullName sign /fd SHA256 /sha1 $cert.Thumbprint dist\bcm2836sdhc.cat
 
       - name: Upload driver package
