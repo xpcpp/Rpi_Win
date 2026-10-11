@@ -35,13 +35,13 @@ jobs:
           ref: ${{ env.UPSTREAM_SHA }}
           path: upstream
 
-      - name: Checkout Windows-driver-samples (WDK CI helpers)
+      - name: Checkout Windows-driver-samples (WDK NuGet config)
         uses: actions/checkout@v4
         with:
           repository: microsoft/Windows-driver-samples
+          ref: 2dc3fd3a0cc84a2933f2194e7ec0871584979071
           path: wds
           sparse-checkout: |
-            .github/scripts
             packages.config
             Directory.Build.props
           sparse-checkout-cone-mode: false
@@ -54,10 +54,6 @@ jobs:
             git apply --verbose --whitespace=nowarn $_.FullName
             if ($LASTEXITCODE -ne 0) { throw "patch failed: $($_.Name)" }
           }
-
-      - name: Install WDK VSIX
-        working-directory: wds
-        run: .\.github\scripts\Install-Vsix.ps1 -optimize:$true
 
       - name: Restore WDK NuGet packages
         run: |
