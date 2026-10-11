@@ -18,6 +18,8 @@ on:
 env:
   # raspberrypi/windows-drivers commit the patches were written against
   UPSTREAM_SHA: 88ee238c9debecce810d208cac1e5f36add3d2a1
+  # WDK NuGet version that targets VS 2022 / MSBuild 17 (28000.x targets VS 2026)
+  WDK_NUGET_VERSION: 10.0.26100.2454
   CONFIG: Release
   PLATFORM: ARM64
 
@@ -35,17 +37,6 @@ jobs:
           ref: ${{ env.UPSTREAM_SHA }}
           path: upstream
 
-      - name: Checkout Windows-driver-samples (WDK NuGet config)
-        uses: actions/checkout@v4
-        with:
-          repository: microsoft/Windows-driver-samples
-          ref: 2dc3fd3a0cc84a2933f2194e7ec0871584979071
-          path: wds
-          sparse-checkout: |
-            packages.config
-            Directory.Build.props
-          sparse-checkout-cone-mode: false
-
       - name: Apply patches
         working-directory: upstream
         run: |
@@ -55,24 +46,35 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "patch failed: $($_.Name)" }
           }
 
-      - name: Restore WDK NuGet packages
+      - name: Restore WDK NuGet packages (pinned version)
         run: |
-          nuget restore wds\packages.config -PackagesDirectory upstream\packages\
-          Copy-Item wds\Directory.Build.props upstream\Directory.Build.props
-
-      - name: Locate / repair WDK build-task DLL (arm64 package lacks it)
-        run: |
-          $found = Get-ChildItem upstream\packages -Recurse -Filter 'Microsoft.DriverKit.Build.Tasks*.dll' -ErrorAction SilentlyContinue
-          Write-Host "::notice title=wdk-dlls::$(($found | ForEach-Object { $_.FullName.Replace((Get-Location).Path + '\upstream\packages\','') }) -join ' | ')"
-          $arm = Get-ChildItem upstream\packages -Directory | Where-Object Name -like 'Microsoft.Windows.WDK.ARM64.*' | Select-Object -First 1
-          $armBin = Join-Path $arm.FullName 'c\build\10.0.28000.0\bin'
-          if (-not (Test-Path (Join-Path $armBin 'Microsoft.DriverKit.Build.Tasks.17.0.dll'))) {
-            $src = $found | Where-Object FullName -like '*WDK.x64*' | Where-Object Name -eq 'Microsoft.DriverKit.Build.Tasks.17.0.dll' | Select-Object -First 1
-            if (-not $src) { throw "task DLL not found in any WDK package" }
-            New-Item -ItemType Directory -Force $armBin | Out-Null
-            Copy-Item (Join-Path $src.DirectoryName '*') $armBin -Recurse -Force
-            Write-Host "::notice title=wdk-dlls-fix::copied bin from $($src.DirectoryName)"
-          }
+          $v = $env:WDK_NUGET_VERSION
+          $pkgs = @'
+<?xml version="1.0" encoding="utf-8"?>
+<packages>
+  <package id="Microsoft.Windows.SDK.CPP" version="__V__" targetFramework="native" />
+  <package id="Microsoft.Windows.SDK.CPP.x64" version="__V__" targetFramework="native" />
+  <package id="Microsoft.Windows.SDK.CPP.arm64" version="__V__" targetFramework="native" />
+  <package id="Microsoft.Windows.WDK.x64" version="__V__" targetFramework="native" />
+  <package id="Microsoft.Windows.WDK.arm64" version="__V__" targetFramework="native" />
+</packages>
+'@
+          $pkgs.Replace('__V__', $v) | Set-Content -Encoding utf8 packages.config
+          $props = @'
+<Project>
+<Import Project="packages\Microsoft.Windows.WDK.x64.__V__\build\native\Microsoft.Windows.WDK.x64.props" Condition="Exists('packages\Microsoft.Windows.WDK.x64.__V__\build\native\Microsoft.Windows.WDK.x64.props') and '$(Platform)' == 'x64'"/>
+<Import Project="packages\Microsoft.Windows.WDK.arm64.__V__\build\native\Microsoft.Windows.WDK.arm64.props" Condition="Exists('packages\Microsoft.Windows.WDK.arm64.__V__\build\native\Microsoft.Windows.WDK.arm64.props') and '$(Platform)' == 'ARM64'"/>
+<Import Project="packages\Microsoft.Windows.SDK.CPP.x64.__V__\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.x64.__V__\build\native\Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'"/>
+<Import Project="packages\Microsoft.Windows.SDK.CPP.arm64.__V__\build\native\Microsoft.Windows.SDK.cpp.arm64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.arm64.__V__\build\native\Microsoft.Windows.SDK.cpp.arm64.props') and '$(Platform)' == 'ARM64'"/>
+<Import Project="packages\Microsoft.Windows.SDK.CPP.__V__\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.__V__\build\native\Microsoft.Windows.SDK.cpp.props')"/>
+</Project>
+'@
+          $props.Replace('__V__', $v) | Set-Content -Encoding utf8 upstream\Directory.Build.props
+          nuget restore packages.config -PackagesDirectory upstream\packages\
+          if ($LASTEXITCODE -ne 0) { throw "nuget restore failed" }
+          $dlls = Get-ChildItem upstream\packages -Recurse -Filter 'Microsoft.DriverKit.Build.Tasks*.dll' |
+                  ForEach-Object { $_.Name } | Sort-Object -Unique
+          Write-Host "::notice title=wdk-task-dlls::$($dlls -join ' | ')"
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
