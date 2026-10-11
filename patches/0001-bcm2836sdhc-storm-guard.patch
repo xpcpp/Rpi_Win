@@ -1,0 +1,62 @@
+--- a/drivers/sd/bcm2836/bcm2836sdhc/bcm2836sdhc.c
++++ b/drivers/sd/bcm2836/bcm2836sdhc/bcm2836sdhc.c
+@@ -44,6 +44,24 @@
+ #define SDHC_IGNORE_CARD_DETECT_INTERRUPT   1
+ 
+ //
++// EXPERIMENTAL interrupt-storm guard (diagnostics for Pi 4 / BCM2847).
++// If this controller reports a nonzero interrupt status more than
++// SDHC_STORM_LIMIT times within one second, all interrupt sources are masked.
++// With SDHC_BUGCHECK_ON_STORM=1 the system then bugchecks (code below) with
++// the raw registers as parameters, so the cause can be read from Event ID
++// 1001 after the reboot instead of the machine hanging (0x133).
++//   Param1 = INTERRUPT_ERROR_STATUS (0x30)   Param2 = STATUS_ENABLE (0x34)
++//   Param3 = SIGNAL_ENABLE (0x38)            Param4 = PRESENT_STATE (0x24)
++//
++#define SDHC_STORM_LIMIT            20000
++#define SDHC_STORM_WINDOW_100NS     10000000LL
++#define SDHC_BUGCHECK_ON_STORM      1
++#define SDHC_STORM_BUGCHECK_CODE    0x5D0C0001
++
++static LONG g_SdhcStormHits;
++static LONGLONG g_SdhcStormWindowStart;
++
++//
+ // Workaround offset was introduced early in the enabling effort to support GPT
+ // partition. The bcm2836 platform (RPi2) only supported MBR partition and the
+ // early UEFI does not allow Windows to boot from MBR. The solution then was
+@@ -715,6 +733,34 @@
+         InterruptStatus &= ~SDHC_IS_CARD_DETECT;
+     #endif // SDHC_IGNORE_CARD_DETECT_INTERRUPT
+ 
++    if (InterruptStatus != 0) {
++        LONGLONG Now = KeQueryInterruptTime();
++
++        if ((Now - g_SdhcStormWindowStart) > SDHC_STORM_WINDOW_100NS) {
++            g_SdhcStormWindowStart = Now;
++            g_SdhcStormHits = 0;
++        } // if
++
++        if (++g_SdhcStormHits > SDHC_STORM_LIMIT) {
++            ULONG RawStatus = SdhcReadRegisterUlong(SdhcExtension, SDHC_INTERRUPT_ERROR_STATUS);
++            ULONG StatusEn  = SdhcReadRegisterUlong(SdhcExtension, SDHC_INTERRUPT_ERROR_STATUS_ENABLE);
++            ULONG SignalEn  = SdhcReadRegisterUlong(SdhcExtension, SDHC_INTERRUPT_ERROR_SIGNAL_ENABLE);
++            ULONG Present   = SdhcReadRegisterUlong(SdhcExtension, SDHC_PRESENT_STATE);
++
++            SdhcWriteRegisterUlong(SdhcExtension, SDHC_INTERRUPT_ERROR_SIGNAL_ENABLE, 0);
++            SdhcWriteRegisterUlong(SdhcExtension, SDHC_INTERRUPT_ERROR_STATUS_ENABLE, 0);
++            g_SdhcStormHits = 0;
++
++            #if SDHC_BUGCHECK_ON_STORM
++                KeBugCheckEx(SDHC_STORM_BUGCHECK_CODE,
++                             RawStatus,
++                             StatusEn,
++                             SignalEn,
++                             Present);
++            #endif // SDHC_BUGCHECK_ON_STORM
++        } // if
++    } // if
++
+     return (InterruptStatus != 0);
+ } // SdhcSlotInterrupt (...)
+ 

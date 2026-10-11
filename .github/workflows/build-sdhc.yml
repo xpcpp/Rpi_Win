@@ -1,0 +1,126 @@
+name: build-bcm2836sdhc
+
+# Builds raspberrypi/windows-drivers' bcm2836sdhc (Arasan SDHCI miniport, ACPI\BCM2847)
+# for ARM64 with the patches in ./patches applied, signs it with a throw-away
+# test certificate and uploads the result as an artifact.
+#
+# NOTE: first draft. Windows driver builds on hosted runners are fiddly; if a step
+# fails, send me the log tail of that step and I will fix the workflow.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'patches/**'
+      - '.github/workflows/**'
+
+env:
+  # raspberrypi/windows-drivers commit the patches were written against
+  UPSTREAM_SHA: 88ee238c9debecce810d208cac1e5f36add3d2a1
+  CONFIG: Release
+  PLATFORM: ARM64
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Checkout raspberrypi/windows-drivers
+        uses: actions/checkout@v4
+        with:
+          repository: raspberrypi/windows-drivers
+          ref: ${{ env.UPSTREAM_SHA }}
+          path: upstream
+
+      - name: Checkout Windows-driver-samples (WDK CI helpers)
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/Windows-driver-samples
+          path: wds
+          sparse-checkout: |
+            .github/scripts
+            packages.config
+            Directory.Build.props
+          sparse-checkout-cone-mode: false
+
+      - name: Apply patches
+        working-directory: upstream
+        run: |
+          Get-ChildItem ..\patches\*.patch | Sort-Object Name | ForEach-Object {
+            Write-Host "Applying $($_.Name)"
+            git apply --verbose --whitespace=nowarn $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "patch failed: $($_.Name)" }
+          }
+
+      - name: Install WDK VSIX
+        working-directory: wds
+        run: .\.github\scripts\Install-Vsix.ps1 -optimize:$true
+
+      - name: Restore WDK NuGet packages
+        run: |
+          nuget restore wds\packages.config -PackagesDirectory upstream\packages\
+          Copy-Item wds\Directory.Build.props upstream\Directory.Build.props
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build bcm2836sdhc (ARM64)
+        run: |
+          $sol = (Resolve-Path upstream\build\bcm2836).Path + '\'
+          msbuild upstream\drivers\sd\bcm2836\bcm2836sdhc\bcm2836sdhc.vcxproj `
+            /p:Configuration=$env:CONFIG /p:Platform=$env:PLATFORM `
+            /p:SolutionDir=$sol /p:SignMode=Off /p:EnableInf2cat=false `
+            /p:TreatWarningAsError=false /p:RunCodeAnalysis=false `
+            /v:m /bl:build.binlog
+
+      - name: Collect outputs
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          foreach ($n in 'bcm2836sdhc.sys','bcm2836sdhc.inf','bcm2836sdhc.pdb') {
+            $f = Get-ChildItem upstream -Recurse -Filter $n |
+                 Where-Object FullName -match 'ARM64' | Select-Object -First 1
+            if (-not $f) { throw "missing build output: $n" }
+            Copy-Item $f.FullName dist\
+          }
+          Get-ChildItem dist | Format-Table Name,Length
+
+      - name: Sign (throw-away test certificate) and make catalog
+        continue-on-error: true
+        run: |
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert `
+            -Subject "CN=Rpi_Win CI test signing run $env:GITHUB_RUN_ID" `
+            -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
+            -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(30)
+          Export-Certificate -Cert $cert -FilePath dist\rpi_win_ci_signing.cer | Out-Null
+          $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          $signtool = Get-ChildItem $kits -Recurse -Filter signtool.exe |
+            Where-Object FullName -match '\\x64\\' | Sort-Object FullName | Select-Object -Last 1
+          $inf2cat = Get-ChildItem upstream\packages,$kits -Recurse -Filter Inf2Cat.exe `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $signtool -or -not $inf2cat) { throw "signtool/Inf2Cat not found" }
+          & $signtool.FullName sign /fd SHA256 /sha1 $cert.Thumbprint dist\bcm2836sdhc.sys
+          $ok = $false
+          foreach ($os in '10_NI_ARM64','10_CO_ARM64','10_RS5_ARM64') {
+            & $inf2cat.FullName /driver:dist /os:$os
+            if ($LASTEXITCODE -eq 0) { $ok = $true; Write-Host "catalog OK for $os"; break }
+          }
+          if (-not $ok) { throw "Inf2Cat failed for all OS tokens" }
+          & $signtool.FullName sign /fd SHA256 /sha1 $cert.Thumbprint dist\bcm2836sdhc.cat
+
+      - name: Upload driver package
+        uses: actions/upload-artifact@v4
+        with:
+          name: bcm2836sdhc-arm64-run${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-run${{ github.run_number }}
+          path: build.binlog
+          if-no-files-found: ignore
