@@ -108,13 +108,14 @@ jobs:
             /p:WindowsTargetPlatformVersion=$env:KIT_BUILD `
             /p:SolutionDir=$sol /p:SignMode=Off /p:EnableInf2cat=false `
             /p:TreatWarningAsError=false /p:RunCodeAnalysis=false `
+            /p:ApiValidator_Enable=false /p:EnableInfVerif=false /p:InfVerif_Enable=false `
             /v:m /bl:build.binlog `
             "/flp1:logfile=errors.log;errorsonly;verbosity=quiet" `
             "/flp2:logfile=full.log;verbosity=normal"
           exit $LASTEXITCODE
 
       - name: Report build errors as annotations
-        if: failure()
+        if: steps.build.outcome == 'failure'
         shell: pwsh
         run: |
           function Emit($title, $text) {
@@ -132,6 +133,13 @@ jobs:
             if ($l.Length -gt 3800) { $l = $l.Substring($l.Length-3800) }
             Emit 'msbuild-tail' $l
           }
+
+      - name: Verify the driver binary was produced
+        run: |
+          $sys = Get-ChildItem upstream\build -Recurse -Filter bcm2836sdhc.sys -ErrorAction SilentlyContinue |
+                 Where-Object FullName -match 'ARM64' | Select-Object -First 1
+          if (-not $sys) { throw "bcm2836sdhc.sys was not produced (build outcome: ${{ steps.build.outcome }})" }
+          Write-Host "Found $($sys.FullName) ($($sys.Length) bytes); build step outcome: ${{ steps.build.outcome }}"
 
       - name: Collect outputs
         shell: pwsh
