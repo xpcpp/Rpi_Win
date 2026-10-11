@@ -50,25 +50,25 @@ jobs:
         run: |
           $v = $env:WDK_NUGET_VERSION
           $pkgs = @'
-<?xml version="1.0" encoding="utf-8"?>
-<packages>
-  <package id="Microsoft.Windows.SDK.CPP" version="__V__" targetFramework="native" />
-  <package id="Microsoft.Windows.SDK.CPP.x64" version="__V__" targetFramework="native" />
-  <package id="Microsoft.Windows.SDK.CPP.arm64" version="__V__" targetFramework="native" />
-  <package id="Microsoft.Windows.WDK.x64" version="__V__" targetFramework="native" />
-  <package id="Microsoft.Windows.WDK.arm64" version="__V__" targetFramework="native" />
-</packages>
-'@
+          <?xml version="1.0" encoding="utf-8"?>
+          <packages>
+          <package id="Microsoft.Windows.SDK.CPP" version="__V__" targetFramework="native" />
+          <package id="Microsoft.Windows.SDK.CPP.x64" version="__V__" targetFramework="native" />
+          <package id="Microsoft.Windows.SDK.CPP.arm64" version="__V__" targetFramework="native" />
+          <package id="Microsoft.Windows.WDK.x64" version="__V__" targetFramework="native" />
+          <package id="Microsoft.Windows.WDK.arm64" version="__V__" targetFramework="native" />
+          </packages>
+          '@
           $pkgs.Replace('__V__', $v) | Set-Content -Encoding utf8 packages.config
           $props = @'
-<Project>
-<Import Project="packages\Microsoft.Windows.WDK.x64.__V__\build\native\Microsoft.Windows.WDK.x64.props" Condition="Exists('packages\Microsoft.Windows.WDK.x64.__V__\build\native\Microsoft.Windows.WDK.x64.props') and '$(Platform)' == 'x64'"/>
-<Import Project="packages\Microsoft.Windows.WDK.arm64.__V__\build\native\Microsoft.Windows.WDK.arm64.props" Condition="Exists('packages\Microsoft.Windows.WDK.arm64.__V__\build\native\Microsoft.Windows.WDK.arm64.props') and '$(Platform)' == 'ARM64'"/>
-<Import Project="packages\Microsoft.Windows.SDK.CPP.x64.__V__\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.x64.__V__\build\native\Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'"/>
-<Import Project="packages\Microsoft.Windows.SDK.CPP.arm64.__V__\build\native\Microsoft.Windows.SDK.cpp.arm64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.arm64.__V__\build\native\Microsoft.Windows.SDK.cpp.arm64.props') and '$(Platform)' == 'ARM64'"/>
-<Import Project="packages\Microsoft.Windows.SDK.CPP.__V__\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.__V__\build\native\Microsoft.Windows.SDK.cpp.props')"/>
-</Project>
-'@
+          <Project>
+          <Import Project="packages\Microsoft.Windows.WDK.x64.__V__\build\native\Microsoft.Windows.WDK.x64.props" Condition="Exists('packages\Microsoft.Windows.WDK.x64.__V__\build\native\Microsoft.Windows.WDK.x64.props') and '$(Platform)' == 'x64'"/>
+          <Import Project="packages\Microsoft.Windows.WDK.arm64.__V__\build\native\Microsoft.Windows.WDK.arm64.props" Condition="Exists('packages\Microsoft.Windows.WDK.arm64.__V__\build\native\Microsoft.Windows.WDK.arm64.props') and '$(Platform)' == 'ARM64'"/>
+          <Import Project="packages\Microsoft.Windows.SDK.CPP.x64.__V__\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.x64.__V__\build\native\Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'"/>
+          <Import Project="packages\Microsoft.Windows.SDK.CPP.arm64.__V__\build\native\Microsoft.Windows.SDK.cpp.arm64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.arm64.__V__\build\native\Microsoft.Windows.SDK.cpp.arm64.props') and '$(Platform)' == 'ARM64'"/>
+          <Import Project="packages\Microsoft.Windows.SDK.CPP.__V__\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.__V__\build\native\Microsoft.Windows.SDK.cpp.props')"/>
+          </Project>
+          '@
           $props.Replace('__V__', $v) | Set-Content -Encoding utf8 upstream\Directory.Build.props
           nuget restore packages.config -PackagesDirectory upstream\packages\
           if ($LASTEXITCODE -ne 0) { throw "nuget restore failed" }
