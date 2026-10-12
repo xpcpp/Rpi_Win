@@ -1,0 +1,78 @@
+name: analyze-dump
+
+# Runs cdb with Microsoft symbols on a crash dump committed under dumps/ and publishes the
+# analysis (release "dump-analysis") + short annotations. Manual only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dump:
+        description: 'Path of the dump inside the repo (e.g. dumps/xyz.dmp)'
+        required: true
+
+jobs:
+  analyze:
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find or install Debugging Tools for Windows
+        run: |
+          $dbgRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers"
+          function Find-Cdb { Get-ChildItem $dbgRoot -Recurse -Filter cdb.exe -ErrorAction SilentlyContinue |
+                              Where-Object FullName -match '\\x64\\' | Select-Object -First 1 }
+          $cdb = Find-Cdb
+          if (-not $cdb) {
+            Invoke-WebRequest 'https://go.microsoft.com/fwlink/?linkid=2338977' -OutFile winsdksetup.exe
+            $p = Start-Process -FilePath .\winsdksetup.exe -Wait -PassThru -ArgumentList '/quiet','/norestart','/features','OptionId.WindowsDesktopDebuggers'
+            Write-Host "SDK debuggers installer exit code: $($p.ExitCode)"
+            $cdb = Find-Cdb
+          }
+          if (-not $cdb) { throw "cdb.exe not found" }
+          "CDB=$($cdb.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "cdb: $($cdb.FullName)"
+
+      - name: Fetch current driver PDBs (for our own frames)
+        run: |
+          New-Item -ItemType Directory pdbs | Out-Null
+          Invoke-WebRequest https://github.com/${{ github.repository }}/releases/download/ci-latest/bcm2836sdhc-arm64.zip -OutFile pkg.zip
+          Expand-Archive pkg.zip pkgx -Force
+          Get-ChildItem pkgx -Recurse -Filter *.pdb | Copy-Item -Destination pdbs\
+          Get-ChildItem pdbs | Format-Table Name,Length
+
+      - name: Analyze
+        run: |
+          $dump = "${{ github.event.inputs.dump }}"
+          if (-not (Test-Path $dump)) { throw "dump not found: $dump" }
+          $sym = "srv*C:\sym*https://msdl.microsoft.com/download/symbols;$((Resolve-Path pdbs).Path)"
+          $cmds = '.symfix+ C:\sym; .reload /f; !analyze -v; .echo ===STACKKV; kv 60; .echo ===MODULES; lmt; .echo ===END; q'
+          & $env:CDB -z $dump -y $sym -c $cmds -logo analysis.txt | Out-Null
+          Get-Content analysis.txt -TotalCount 5
+          Write-Host ("analysis.txt lines: " + (Get-Content analysis.txt).Count)
+
+      - name: Publish analysis (release dump-analysis)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete dump-analysis --yes --cleanup-tag
+          $global:LASTEXITCODE = 0
+          gh release create dump-analysis analysis.txt --prerelease --target ${{ github.sha }} `
+            --title "dump analysis" --notes "cdb !analyze -v output for ${{ github.event.inputs.dump }}"
+          exit $LASTEXITCODE
+
+      - name: Key lines as annotations
+        run: |
+          $t = Get-Content analysis.txt
+          function Emit($title, $lines) {
+            $s = ($lines -join "`n"); if ($s.Length -gt 3800) { $s = $s.Substring(0,3800) }
+            $s = $s -replace '%','%25' -replace "`r",'' -replace "`n",'%0A'
+            Write-Host "::notice title=$title::$s"
+          }
+          $keys = $t | Where-Object { $_ -match '^(BUGCHECK_CODE|BUGCHECK_P|IMAGE_NAME|MODULE_NAME|FAULTING_MODULE|SYMBOL_NAME|FAILURE_BUCKET_ID|PROCESS_NAME|STACK_COMMAND|BUGCHECK_STR|FAULTING_IP)' }
+          Emit 'analyze-keys' $keys
+          $i = ($t | Select-String -Pattern '^STACK_TEXT' | Select-Object -First 1).LineNumber
+          if ($i) { Emit 'analyze-stack' ($t[($i-1)..([Math]::Min($i+40,$t.Count-1))]) }
+          $k = ($t | Select-String -Pattern '===STACKKV' | Select-Object -First 1).LineNumber
+          if ($k) { Emit 'kv-stack' ($t[($k)..([Math]::Min($k+45,$t.Count-1))]) }
