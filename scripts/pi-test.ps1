@@ -10,6 +10,7 @@
  If scripts are blocked:  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
    .\pi-test.ps1 -Action Probe       # print what the SDIO probe driver found (chip signature etc.)
    .\pi-test.ps1 -Action Rearm       # allow sdioprobe to run again after it was skipped/crashed
+   .\pi-test.ps1 -Action Install -ZipPath C:\path\bcm2836sdhc-arm64.zip   # use a zip you already have (no download)
    .\pi-test.ps1 -Action Install -Only sdiofn   # install only the probe (leave the sdhc driver alone)
    .\pi-test.ps1 -Action Diag        # collect everything (problem codes, PnP events, probe) into diag.txt
    .\pi-test.ps1 -Action Bugcheck    # decode the last bugcheck (storm-guard registers)
@@ -20,6 +21,7 @@ param(
   [string]$Repo = 'xpcpp/Rpi_Win',
   [string]$Tag  = 'ci-latest',
   [ValidateSet('all','sdhc','sdiofn')][string]$Only = 'all',
+  [string]$ZipPath = '',
   [switch]$Yes
 )
 $ErrorActionPreference = 'Stop'
@@ -135,6 +137,25 @@ function Remove-TestCerts {
   }
 }
 
+function Get-Package {
+  param([string]$Url, [string]$Dest)
+  for ($i = 1; $i -le 5; $i++) {
+    try {
+      Write-Host "Download attempt $i/5 (Invoke-WebRequest)"
+      Invoke-WebRequest -UseBasicParsing $Url -OutFile $Dest -TimeoutSec 120
+      if ((Get-Item $Dest).Length -gt 10000) { return }
+    } catch { Write-Host "  failed: $($_.Exception.Message)" }
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if ($curl) {
+      Write-Host "Download attempt $i/5 (curl.exe)"
+      & $curl.Source -L --fail --retry 3 --retry-all-errors --connect-timeout 20 -o $Dest $Url
+      if ($LASTEXITCODE -eq 0 -and (Test-Path $Dest) -and (Get-Item $Dest).Length -gt 10000) { return }
+    }
+    Start-Sleep -Seconds (5 * $i)
+  }
+  throw "Could not download $Url. Download it on another device and rerun with -ZipPath <file>."
+}
+
 function Install-CiDriver {
   if (-not (Test-Admin)) { throw 'Run this from an elevated PowerShell.' }
   Write-Host 'WARNING: the stock driver froze this Pi (DPC_WATCHDOG 0x133). The CI build has a storm guard'
@@ -144,9 +165,14 @@ function Install-CiDriver {
   $dir = Join-Path $env:TEMP 'rpiwin-ci'
   Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory $dir | Out-Null
-  $url = "https://github.com/$Repo/releases/download/$Tag/bcm2836sdhc-arm64.zip"
-  Write-Host "Downloading $url"
-  Invoke-WebRequest -UseBasicParsing $url -OutFile "$dir\pkg.zip"
+  if ($ZipPath) {
+    if (-not (Test-Path $ZipPath)) { throw "ZipPath not found: $ZipPath" }
+    Copy-Item $ZipPath "$dir\pkg.zip"
+  } else {
+    $url = "https://github.com/$Repo/releases/download/$Tag/bcm2836sdhc-arm64.zip"
+    Write-Host "Downloading $url"
+    Get-Package -Url $url -Dest "$dir\pkg.zip"
+  }
   Expand-Archive "$dir\pkg.zip" -DestinationPath "$dir\pkg" -Force
 
   $inf = Get-ChildItem "$dir\pkg" -Recurse -Filter bcm2836sdhc.inf | Select-Object -First 1
