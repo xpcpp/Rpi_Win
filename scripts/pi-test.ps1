@@ -56,10 +56,11 @@ function Show-Info {
 }
 
 function Remove-SdhcPackages {
+  param([string]$Pattern = 'bcm2836sdhc|sdioprobe')
   $cur = $null
   pnputil /enum-drivers | ForEach-Object {
     if ($_ -match 'Published Name:\s+(oem\d+\.inf)') { $cur = $Matches[1] }
-    if ($_ -match 'Original Name:\s+(bcm2836sdhc|sdioprobe)\.inf' -and $cur) {
+    if ($_ -match ('Original Name:\s+(' + $Pattern + ')\.inf') -and $cur) {
       Write-Host "Removing $cur ($($Matches[1]))"
       pnputil /delete-driver $cur /uninstall /force | Out-Host
     }
@@ -157,6 +158,7 @@ function Install-CiDriver {
   Checkpoint-Computer -Description 'pre-ci-sdhc' -RestorePointType MODIFY_SETTINGS -ErrorAction SilentlyContinue
 
   if ($Only -eq 'all') { Remove-SdhcPackages; Remove-TestCerts }
+  elseif ($Only -eq 'sdiofn') { Remove-SdhcPackages -Pattern 'sdioprobe' }
   $c = Import-Certificate $cer.FullName -CertStoreLocation Cert:\LocalMachine\Root
   Import-Certificate $cer.FullName -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
   Write-Host "Trusted test cert: $($c.Subject)"
@@ -170,7 +172,7 @@ function Install-CiDriver {
   Show-Status
   if ($inf2) { Show-Probe }
   Write-Host ''
-  Write-Host 'Now REBOOT (Restart-Computer) if BCM2847 shows Error / problem code 14, then run: .\pi-test.ps1 -Action Diag'
+  Write-Host 'Reboot only if BCM2847 shows Error / problem code 14. Otherwise paste this output to me; for more detail run: .\pi-test.ps1 -Action Diag'
 }
 
 function Read-Bugcheck {
