@@ -5,11 +5,14 @@
    iwr -UseBasicParsing https://raw.githubusercontent.com/xpcpp/Rpi_Win/main/scripts/pi-test.ps1 -OutFile pi-test.ps1
    .\pi-test.ps1 -Action Install     # download latest CI build, trust its cert, install it
    .\pi-test.ps1 -Action Status      # BCM2847 / SD device state + installed packages
+   .\pi-test.ps1 -Action Info        # hardware/compatible IDs + problem codes of the SDIO (WiFi) devices
+
+ If scripts are blocked:  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
    .\pi-test.ps1 -Action Bugcheck    # decode the last bugcheck (storm-guard registers)
    .\pi-test.ps1 -Action Cleanup     # remove driver package(s) and test certs
 #>
 param(
-  [ValidateSet('Install','Status','Bugcheck','Cleanup')][string]$Action = 'Status',
+  [ValidateSet('Install','Status','Info','Bugcheck','Cleanup')][string]$Action = 'Status',
   [string]$Repo = 'xpcpp/Rpi_Win',
   [string]$Tag  = 'ci-latest',
   [switch]$Yes
@@ -23,13 +26,28 @@ function Test-Admin {
 
 function Show-Status {
   Write-Host '--- test signing:'
-  bcdedit /enum '{current}' | Select-String 'testsigning'
+  (cmd /c 'bcdedit /enum {current}' | Select-String -Pattern 'testsigning|nointegritychecks') -join "`n"
   Write-Host '--- BCM2847 and SD devices:'
   Get-PnpDevice -PresentOnly |
     Where-Object { $_.InstanceId -like 'ACPI\BCM2847*' -or $_.InstanceId -like 'SD\*' } |
     Select-Object Status,Class,FriendlyName,InstanceId | Format-Table -AutoSize -Wrap
   Write-Host '--- installed bcm2836sdhc packages:'
   pnputil /enum-drivers | Select-String -Context 1,6 'bcm2836sdhc'
+}
+
+function Show-Info {
+  $devs = Get-PnpDevice -PresentOnly |
+    Where-Object { $_.InstanceId -like 'ACPI\BCM2847*' -or $_.InstanceId -like 'SD\VID_02D0*' }
+  foreach ($d in $devs) {
+    Write-Host ('=== ' + $d.InstanceId)
+    foreach ($k in 'DEVPKEY_Device_ProblemCode','DEVPKEY_Device_HardwareIds','DEVPKEY_Device_CompatibleIds',
+                   'DEVPKEY_Device_Service','DEVPKEY_Device_DriverInfPath','DEVPKEY_Device_Parent') {
+      $v = (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName $k -ErrorAction SilentlyContinue).Data
+      Write-Host ('  {0}: {1}' -f ($k -replace 'DEVPKEY_Device_',''), ($v -join ', '))
+    }
+  }
+  Write-Host '--- boot options:'
+  (cmd /c 'bcdedit /enum {current}') | Select-String -Pattern 'testsigning|nointegritychecks|loadoptions|debug'
 }
 
 function Remove-SdhcPackages {
@@ -114,6 +132,7 @@ function Read-Bugcheck {
 switch ($Action) {
   'Install'  { Install-CiDriver }
   'Status'   { Show-Status }
+  'Info'     { Show-Info }
   'Bugcheck' { Read-Bugcheck }
   'Cleanup'  {
     if (-not (Test-Admin)) { throw 'Run this from an elevated PowerShell.' }
