@@ -155,6 +155,25 @@ jobs:
           }
           Get-ChildItem dist | Format-Table Name,Length
 
+      - name: Export WDK headers for reference (release "kit-headers")
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $inc = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
+          $km = "$inc\$env:KIT_BUILD\km"
+          New-Item -ItemType Directory hdr | Out-Null
+          foreach ($n in 'ntddsd.h','sdport.h','sdbus.h') {
+            if (Test-Path "$km\$n") { Copy-Item "$km\$n" hdr\ }
+          }
+          $kmdf = Get-ChildItem "$inc\wdf\kmdf" -Directory -ErrorAction SilentlyContinue | ForEach-Object Name
+          Set-Content hdr\kit-info.txt ("KMDF versions: " + ($kmdf -join ', ') + "`n" + ((Get-ChildItem $km -Filter 'sd*.h' | ForEach-Object Name) -join "`n"))
+          gh release delete kit-headers --yes --cleanup-tag
+          $global:LASTEXITCODE = 0
+          gh release create kit-headers (Get-ChildItem hdr\*).FullName --prerelease --target ${{ github.sha }} `
+            --title "WDK headers (reference)" --notes "Headers exported from the CI runner for driver development."
+          exit $LASTEXITCODE
+
       - name: Sign (throw-away test certificate) and make catalog
         continue-on-error: true
         shell: pwsh
