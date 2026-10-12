@@ -24,8 +24,12 @@ typedef struct _DEV_CTX {
     WDFDEVICE                Device;
     SDBUS_INTERFACE_STANDARD Bus;
     BOOLEAN                  BusOpen;
+    NTSTATUS                 OpenSt;       /* last SdBusOpenInterface status       */
+    NTSTATUS                 InitSt;       /* last InitializeInterface status      */
     UCHAR                    Fn;
-    PULONG                   XferBuf;      /* 4 bytes, non-paged, for CMD53 */
+    WDFWORKITEM              Work;
+    volatile LONG            Ran;          /* probe already queued for this start  */
+    PULONG                   XferBuf;      /* 4 bytes, non-paged, for CMD53        */
     PMDL                     XferMdl;
     WDFKEY                   Key;
 } DEV_CTX, *PDEV_CTX;
@@ -34,8 +38,11 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEV_CTX, GetCtx)
 
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD       EvtDeviceAdd;
-EVT_WDF_DEVICE_PREPARE_HARDWARE EvtPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE EvtReleaseHardware;
+EVT_WDF_DEVICE_D0_ENTRY         EvtD0Entry;
+EVT_WDF_DEVICE_QUERY_REMOVE     EvtQueryRemove;
+EVT_WDF_DEVICE_SURPRISE_REMOVAL EvtSurpriseRemoval;
+EVT_WDF_WORKITEM                EvtProbeWork;
 
 static const SDCMD_DESCRIPTOR g_Cmd52Read  = { SDCMD_IO_RW_DIRECT,   SDCC_STANDARD, SDTD_READ,  SDTT_CMD_ONLY,      SDRT_5 };
 static const SDCMD_DESCRIPTOR g_Cmd52Write = { SDCMD_IO_RW_DIRECT,   SDCC_STANDARD, SDTD_WRITE, SDTT_CMD_ONLY,      SDRT_5 };
@@ -59,6 +66,59 @@ static VOID PutStep(_In_ PDEV_CTX Ctx, _In_ PCWSTR StName, _In_ NTSTATUS St,
     Put(Ctx, ValName, Val);
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "sdioprobe: %ws=0x%08x %ws=0x%08x\n",
                StName, (ULONG)St, ValName, Val);
+}
+
+/* ---------- open / initialize / close the SD bus interface ------------------- */
+/*
+ * Per Microsoft ("Opening, Initializing and Closing an SD Card Bus Interface"):
+ *  - SdBusOpenInterface() must be followed by InitializeInterface(),
+ *  - the interface is closed with InterfaceDereference() on query-remove / surprise-removal /
+ *    remove, and the structure is zeroed afterwards so it can never be dereferenced twice.
+ */
+static VOID CloseBus(_In_ PDEV_CTX Ctx)
+{
+    if (Ctx->BusOpen) {
+        if (Ctx->Bus.InterfaceDereference != NULL) {
+            Ctx->Bus.InterfaceDereference(Ctx->Bus.Context);
+        }
+        RtlZeroMemory(&Ctx->Bus, sizeof(Ctx->Bus));
+        Ctx->BusOpen = FALSE;
+    }
+}
+
+static NTSTATUS OpenBus(_In_ PDEV_CTX Ctx)
+{
+    SDBUS_INTERFACE_PARAMETERS ip;
+
+    if (Ctx->BusOpen) return STATUS_SUCCESS;
+
+    RtlZeroMemory(&Ctx->Bus, sizeof(Ctx->Bus));
+    Ctx->OpenSt = SdBusOpenInterface(WdfDeviceWdmGetPhysicalDevice(Ctx->Device), &Ctx->Bus,
+                                     sizeof(Ctx->Bus), SDBUS_INTERFACE_VERSION);
+    if (!NT_SUCCESS(Ctx->OpenSt)) {
+        Ctx->InitSt = STATUS_UNSUCCESSFUL;
+        return Ctx->OpenSt;
+    }
+    Ctx->BusOpen = TRUE;   /* opened: from here on CloseBus() must dereference it */
+
+    RtlZeroMemory(&ip, sizeof(ip));
+    ip.Size = sizeof(ip);
+    ip.TargetObject = WdfDeviceWdmGetAttachedDevice(Ctx->Device);
+    ip.DeviceGeneratesInterrupts = FALSE;     /* probe only: no card interrupts */
+    ip.CallbackAtDpcLevel = FALSE;
+    ip.CallbackRoutine = NULL;
+    ip.CallbackRoutineContext = NULL;
+
+    if (Ctx->Bus.InitializeInterface == NULL) {
+        Ctx->InitSt = STATUS_UNSUCCESSFUL;
+    } else {
+        Ctx->InitSt = Ctx->Bus.InitializeInterface(Ctx->Bus.Context, &ip);
+    }
+    if (!NT_SUCCESS(Ctx->InitSt)) {
+        CloseBus(Ctx);
+        return Ctx->InitSt;
+    }
+    return STATUS_SUCCESS;
 }
 
 /* ---------- sdbus helpers ---------------------------------------------------- */
@@ -240,58 +300,87 @@ static VOID RunProbe(_In_ PDEV_CTX Ctx)
 
 /* ---------- WDF plumbing ------------------------------------------------------ */
 
-NTSTATUS EvtPrepareHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Raw, _In_ WDFCMRESLIST Trans)
+/* Runs on a system worker thread, ~1 s after D0Entry, i.e. after the start IRP completed. */
+VOID EvtProbeWork(_In_ WDFWORKITEM Work)
 {
-    PDEV_CTX ctx = GetCtx(Device);
+    WDFDEVICE dev = (WDFDEVICE)WdfWorkItemGetParentObject(Work);
+    PDEV_CTX ctx = GetCtx(dev);
     NTSTATUS st;
+    ULONG i;
 
-    UNREFERENCED_PARAMETER(Raw);
-    UNREFERENCED_PARAMETER(Trans);
+    for (i = 0; i < 10; i++) Delay100ms();
 
     ctx->Key = NULL;
-    st = WdfDeviceOpenRegistryKey(Device, PLUGPLAY_REGKEY_DEVICE, KEY_SET_VALUE | KEY_QUERY_VALUE,
-                             WDF_NO_OBJECT_ATTRIBUTES, &ctx->Key);
-    if (!NT_SUCCESS(st)) ctx->Key = NULL;
+    st = WdfDeviceOpenRegistryKey(dev, PLUGPLAY_REGKEY_DEVICE, KEY_SET_VALUE | KEY_QUERY_VALUE,
+                                  WDF_NO_OBJECT_ATTRIBUTES, &ctx->Key);
+    if (!NT_SUCCESS(st)) { ctx->Key = NULL; return; }
 
     /*
-     * Self-disarming: ProbeState 0/absent = never ran, 1 = started but did not finish
-     * (hang / bugcheck last time), 2 = finished. If the last run did not finish we do NOT
-     * touch the card again, so a crashing probe can never cause a boot loop.
-     * Re-arm from PowerShell: set ProbeState = 0 (pi-test.ps1 -Action Rearm).
+     * Self-disarming: ProbeState absent/0 = never ran, 1 = started but did not finish,
+     * 2 = finished. If the last run did not finish we do not touch the card again, so a
+     * crashing probe can never cause a boot loop. Re-arm: pi-test.ps1 -Action Rearm.
      */
-    if (ctx->Key != NULL) {
+    {
         UNICODE_STRING nm;
         ULONG state = 0;
         RtlInitUnicodeString(&nm, L"ProbeState");
         if (NT_SUCCESS(WdfRegistryQueryULong(ctx->Key, &nm, &state)) && state == 1) {
             Put(ctx, L"Skipped_Prev_Incomplete", 1);
-            return STATUS_SUCCESS;
+            goto done;
         }
         Put(ctx, L"ProbeState", 1);
         Put(ctx, L"Skipped_Prev_Incomplete", 0);
     }
+
+    Put(ctx, L"Ver", 2);                       /* probe code version */
+    st = OpenBus(ctx);                         /* no-op if EvtDeviceAdd already opened it */
+    Put(ctx, L"Open_St", (ULONG)ctx->OpenSt);
+    Put(ctx, L"Init_St", (ULONG)ctx->InitSt);
+    if (!NT_SUCCESS(st)) { Put(ctx, L"ProbeState", 2); goto done; }
 
     ctx->XferBuf = (PULONG)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(ULONG), PROBE_TAG);
     if (ctx->XferBuf != NULL) {
         ctx->XferMdl = IoAllocateMdl(ctx->XferBuf, sizeof(ULONG), FALSE, FALSE, NULL);
         if (ctx->XferMdl != NULL) MmBuildMdlForNonPagedPool(ctx->XferMdl);
     }
-
-    st = SdBusOpenInterface(WdfDeviceWdmGetPhysicalDevice(Device), &ctx->Bus,
-                            sizeof(ctx->Bus), SDBUS_INTERFACE_VERSION);
-    Put(ctx, L"Open_St", (ULONG)st);
-    if (!NT_SUCCESS(st)) {
-        ctx->BusOpen = FALSE;
-        return STATUS_SUCCESS;   /* stay loaded; the registry says what happened */
-    }
-    ctx->BusOpen = TRUE;
-
     if (ctx->XferBuf != NULL && ctx->XferMdl != NULL) {
         RunProbe(ctx);
     } else {
         Put(ctx, L"Probe_Done", 0xFFFFFFFF);
     }
+    if (ctx->XferMdl != NULL) { IoFreeMdl(ctx->XferMdl); ctx->XferMdl = NULL; }
+    if (ctx->XferBuf != NULL) { ExFreePoolWithTag(ctx->XferBuf, PROBE_TAG); ctx->XferBuf = NULL; }
+
+done:
+    if (ctx->Key != NULL) { WdfRegistryClose(ctx->Key); ctx->Key = NULL; }
+}
+
+NTSTATUS EvtD0Entry(_In_ WDFDEVICE Device, _In_ WDF_POWER_DEVICE_STATE PreviousState)
+{
+    PDEV_CTX ctx = GetCtx(Device);
+    UNREFERENCED_PARAMETER(PreviousState);
+
+    if (InterlockedCompareExchange(&ctx->Ran, 1, 0) == 0) {
+        WdfWorkItemEnqueue(ctx->Work);
+    }
     return STATUS_SUCCESS;
+}
+
+static VOID Quiesce(_In_ PDEV_CTX ctx)
+{
+    WdfWorkItemFlush(ctx->Work);     /* wait for a running probe to finish */
+    CloseBus(ctx);
+}
+
+NTSTATUS EvtQueryRemove(_In_ WDFDEVICE Device)
+{
+    Quiesce(GetCtx(Device));
+    return STATUS_SUCCESS;
+}
+
+VOID EvtSurpriseRemoval(_In_ WDFDEVICE Device)
+{
+    Quiesce(GetCtx(Device));
 }
 
 NTSTATUS EvtReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Trans)
@@ -299,13 +388,8 @@ NTSTATUS EvtReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Trans)
     PDEV_CTX ctx = GetCtx(Device);
     UNREFERENCED_PARAMETER(Trans);
 
-    if (ctx->BusOpen) {
-        ctx->Bus.InterfaceDereference(ctx->Bus.Context);
-        ctx->BusOpen = FALSE;
-    }
-    if (ctx->XferMdl != NULL) { IoFreeMdl(ctx->XferMdl); ctx->XferMdl = NULL; }
-    if (ctx->XferBuf != NULL) { ExFreePoolWithTag(ctx->XferBuf, PROBE_TAG); ctx->XferBuf = NULL; }
-    if (ctx->Key != NULL)     { WdfRegistryClose(ctx->Key); ctx->Key = NULL; }
+    Quiesce(ctx);
+    InterlockedExchange(&ctx->Ran, 0);     /* a later start may probe again */
     return STATUS_SUCCESS;
 }
 
@@ -313,21 +397,36 @@ NTSTATUS EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
 {
     WDF_PNPPOWER_EVENT_CALLBACKS pnp;
     WDF_OBJECT_ATTRIBUTES attrs;
+    WDF_WORKITEM_CONFIG wi;
     WDFDEVICE device;
+    PDEV_CTX ctx;
     NTSTATUS st;
 
     UNREFERENCED_PARAMETER(Driver);
 
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnp);
-    pnp.EvtDevicePrepareHardware = EvtPrepareHardware;
+    pnp.EvtDeviceD0Entry         = EvtD0Entry;
     pnp.EvtDeviceReleaseHardware = EvtReleaseHardware;
+    pnp.EvtDeviceQueryRemove     = EvtQueryRemove;
+    pnp.EvtDeviceSurpriseRemoval = EvtSurpriseRemoval;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnp);
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attrs, DEV_CTX);
     st = WdfDeviceCreate(&DeviceInit, &attrs, &device);
     if (!NT_SUCCESS(st)) return st;
 
-    GetCtx(device)->Device = device;
+    ctx = GetCtx(device);
+    ctx->Device = device;
+
+    WDF_WORKITEM_CONFIG_INIT(&wi, EvtProbeWork);
+    wi.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attrs);
+    attrs.ParentObject = device;
+    st = WdfWorkItemCreate(&wi, &attrs, &ctx->Work);
+    if (!NT_SUCCESS(st)) return st;
+
+    /* Documented place to open + initialize the bus interface. If it fails here the probe retries later. */
+    (VOID)OpenBus(ctx);
     return STATUS_SUCCESS;
 }
 
