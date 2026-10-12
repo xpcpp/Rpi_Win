@@ -163,7 +163,7 @@ jobs:
           $inc = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
           $km = "$inc\$env:KIT_BUILD\km"
           New-Item -ItemType Directory hdr | Out-Null
-          foreach ($n in 'ntddsd.h','sdport.h','sdbus.h') {
+          foreach ($n in 'ntddsd.h','sdport.h','sddef.h','sdbus.h') {
             if (Test-Path "$km\$n") { Copy-Item "$km\$n" hdr\ }
           }
           $kmdf = Get-ChildItem "$inc\wdf\kmdf" -Directory -ErrorAction SilentlyContinue | ForEach-Object Name
