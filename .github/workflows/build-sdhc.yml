@@ -215,6 +215,12 @@ jobs:
             --notes "Built from ${{ github.sha }} by workflow run ${{ github.run_number }}. Use scripts/pi-test.ps1."
           exit $LASTEXITCODE
 
+      - name: Fail the job if the probe driver did not build
+        if: steps.build_probe.outcome == 'failure'
+        run: |
+          Write-Host "::error::sdioprobe did not build - see the msbuild-errors-probe annotation"
+          exit 1
+
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4

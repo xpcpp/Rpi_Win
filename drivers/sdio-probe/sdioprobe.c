@@ -49,7 +49,7 @@ static VOID Put(_In_ PDEV_CTX Ctx, _In_ PCWSTR Name, _In_ ULONG Value)
     if (Ctx->Key == NULL) return;
     RtlInitUnicodeString(&n, Name);
     (VOID)WdfRegistryAssignULong(Ctx->Key, &n, Value);
-    (VOID)ZwFlushKey(WdfRegistryGetHandle(Ctx->Key));   /* survive a bugcheck right after */
+    (VOID)ZwFlushKey(WdfRegistryWdmGetHandle(Ctx->Key));   /* survive a bugcheck right after */
 }
 
 static VOID PutStep(_In_ PDEV_CTX Ctx, _In_ PCWSTR StName, _In_ NTSTATUS St,
