@@ -15,6 +15,7 @@
  */
 #include <ntddk.h>
 #include <wdf.h>
+#include <initguid.h>   /* instantiate GUID_SDBUS_INTERFACE_STANDARD for sdbus.lib */
 #include <ntddsd.h>
 
 #define PROBE_TAG 'bPdS'
