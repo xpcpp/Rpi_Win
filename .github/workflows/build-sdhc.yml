@@ -30,6 +30,8 @@ env:
 jobs:
   build:
     runs-on: windows-2022
+    permissions:
+      contents: write   # needed to publish the ci-latest release
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
@@ -183,6 +185,18 @@ jobs:
           name: bcm2836sdhc-arm64-run${{ github.run_number }}
           path: dist/
           if-no-files-found: error
+
+      - name: Publish to release "ci-latest" (public iwr download for the Pi)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Compress-Archive -Path dist\* -DestinationPath bcm2836sdhc-arm64.zip -Force
+          gh release delete ci-latest --yes --cleanup-tag
+          $global:LASTEXITCODE = 0
+          gh release create ci-latest bcm2836sdhc-arm64.zip --prerelease --target ${{ github.sha }} `
+            --title "CI latest (run ${{ github.run_number }})" `
+            --notes "Built from ${{ github.sha }} by workflow run ${{ github.run_number }}. Use scripts/pi-test.ps1."
+          exit $LASTEXITCODE
 
       - name: Upload build log
         if: always()
