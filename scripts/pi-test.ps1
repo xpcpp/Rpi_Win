@@ -9,11 +9,12 @@
 
  If scripts are blocked:  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
    .\pi-test.ps1 -Action Probe       # print what the SDIO probe driver found (chip signature etc.)
+   .\pi-test.ps1 -Action Diag        # collect everything (problem codes, PnP events, probe) into diag.txt
    .\pi-test.ps1 -Action Bugcheck    # decode the last bugcheck (storm-guard registers)
    .\pi-test.ps1 -Action Cleanup     # remove driver package(s) and test certs
 #>
 param(
-  [ValidateSet('Install','Status','Info','Probe','Bugcheck','Cleanup')][string]$Action = 'Status',
+  [ValidateSet('Install','Status','Info','Probe','Diag','Bugcheck','Cleanup')][string]$Action = 'Status',
   [string]$Repo = 'xpcpp/Rpi_Win',
   [string]$Tag  = 'ci-latest',
   [switch]$Yes
@@ -81,6 +82,36 @@ function Show-Probe {
       else { Write-Host ('  >>> chip signature = 0x{0:X8} (Linux saw 0x15294345)' -f [uint32]$sig) }
     }
   }
+}
+
+function Invoke-Diag {
+  $out = Join-Path (Get-Location) 'diag.txt'
+  & {
+    Write-Host ("=== diag " + (Get-Date -Format s))
+    Write-Host '=== Status';  Show-Status
+    Write-Host '=== Info';    Show-Info
+    Write-Host '=== BCM2847 problem status'
+    foreach ($k in 'DEVPKEY_Device_ProblemCode','DEVPKEY_Device_ProblemStatus') {
+      $v = (Get-PnpDeviceProperty -InstanceId 'ACPI\BCM2847\0' -KeyName $k -ErrorAction SilentlyContinue).Data
+      Write-Host ('  {0} = {1}' -f ($k -replace 'DEVPKEY_Device_',''), $(if ($null -ne $v) { '0x{0:X}' -f [uint32]$v } else { '(none)' }))
+    }
+    Write-Host '=== Probe registry'; Show-Probe
+    Write-Host '=== Kernel-PnP configuration events about our devices (newest first)'
+    try {
+      Get-WinEvent -LogName 'Microsoft-Windows-Kernel-PnP/Configuration' -MaxEvents 200 -ErrorAction Stop |
+        Where-Object { $_.Message -match 'BCM2847|sdioprobe|bcm2836sdhc|SD\\VID_02D0' } | Select-Object -First 15 |
+        ForEach-Object { Write-Host ('{0} id={1}: {2}' -f $_.TimeCreated.ToString('s'), $_.Id, ($_.Message -replace '\s+',' ')) }
+    } catch { Write-Host "  (cannot read: $($_.Exception.Message))" }
+    Write-Host '=== System log errors/warnings, last 40 min'
+    try {
+      Get-WinEvent -FilterHashtable @{LogName='System'; Level=1,2,3; StartTime=(Get-Date).AddMinutes(-40)} -MaxEvents 25 -ErrorAction Stop |
+        ForEach-Object { $m = ($_.Message -replace '\s+',' '); if ($m.Length -gt 300) { $m = $m.Substring(0,300) }
+                         Write-Host ('{0} {1} id={2}: {3}' -f $_.TimeCreated.ToString('s'), $_.ProviderName, $_.Id, $m) }
+    } catch { Write-Host "  (none/cannot read: $($_.Exception.Message))" }
+    Write-Host '=== last bugcheck'; Read-Bugcheck
+  } *>&1 | Out-String -Width 220 | Tee-Object -FilePath $out
+  Write-Host ''
+  Write-Host "Saved to $out  - paste its content back to me."
 }
 
 function Remove-TestCerts {
@@ -163,6 +194,7 @@ switch ($Action) {
   'Status'   { Show-Status }
   'Info'     { Show-Info }
   'Probe'    { Show-Probe }
+  'Diag'     { Invoke-Diag }
   'Bugcheck' { Read-Bugcheck }
   'Cleanup'  {
     if (-not (Test-Admin)) { throw 'Run this from an elevated PowerShell.' }
