@@ -9,14 +9,17 @@
 
  If scripts are blocked:  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
    .\pi-test.ps1 -Action Probe       # print what the SDIO probe driver found (chip signature etc.)
+   .\pi-test.ps1 -Action Rearm       # allow sdioprobe to run again after it was skipped/crashed
+   .\pi-test.ps1 -Action Install -Only sdiofn   # install only the probe (leave the sdhc driver alone)
    .\pi-test.ps1 -Action Diag        # collect everything (problem codes, PnP events, probe) into diag.txt
    .\pi-test.ps1 -Action Bugcheck    # decode the last bugcheck (storm-guard registers)
    .\pi-test.ps1 -Action Cleanup     # remove driver package(s) and test certs
 #>
 param(
-  [ValidateSet('Install','Status','Info','Probe','Diag','Bugcheck','Cleanup')][string]$Action = 'Status',
+  [ValidateSet('Install','Status','Info','Probe','Rearm','Diag','Bugcheck','Cleanup')][string]$Action = 'Status',
   [string]$Repo = 'xpcpp/Rpi_Win',
   [string]$Tag  = 'ci-latest',
+  [ValidateSet('all','sdhc','sdiofn')][string]$Only = 'all',
   [switch]$Yes
 )
 $ErrorActionPreference = 'Stop'
@@ -61,6 +64,15 @@ function Remove-SdhcPackages {
       pnputil /delete-driver $cur /uninstall /force | Out-Host
     }
   }
+}
+
+function Reset-Probe {
+  $root = 'HKLM:\SYSTEM\CurrentControlSet\Enum\SD\VID_02D0&PID_A9A6&FN_1'
+  foreach ($inst in Get-ChildItem $root -ErrorAction SilentlyContinue) {
+    $k = Join-Path $inst.PSPath 'Device Parameters'
+    if (Test-Path $k) { Set-ItemProperty $k -Name ProbeState -Value 0 -Type DWord; Write-Host "ProbeState=0 for $($inst.PSChildName)" }
+  }
+  Write-Host 'Re-armed. Reboot (or disable/enable the FN_1 device) so the probe runs again.'
 }
 
 function Show-Probe {
@@ -144,15 +156,13 @@ function Install-CiDriver {
   Enable-ComputerRestore -Drive 'C:\' -ErrorAction SilentlyContinue
   Checkpoint-Computer -Description 'pre-ci-sdhc' -RestorePointType MODIFY_SETTINGS -ErrorAction SilentlyContinue
 
-  Remove-SdhcPackages
-  Remove-TestCerts
+  if ($Only -eq 'all') { Remove-SdhcPackages; Remove-TestCerts }
   $c = Import-Certificate $cer.FullName -CertStoreLocation Cert:\LocalMachine\Root
   Import-Certificate $cer.FullName -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
   Write-Host "Trusted test cert: $($c.Subject)"
 
-  pnputil /add-driver $inf.FullName /install | Out-Host
-  Start-Sleep -Seconds 15
-  if ($inf2) {
+  if ($Only -ne 'sdiofn') { pnputil /add-driver $inf.FullName /install | Out-Host; Start-Sleep -Seconds 15 }
+  if ($inf2 -and $Only -ne 'sdhc') {
     Write-Host 'Installing sdioprobe (SDIO function driver)...'
     pnputil /add-driver $inf2.FullName /install | Out-Host
     Start-Sleep -Seconds 10
@@ -160,7 +170,7 @@ function Install-CiDriver {
   Show-Status
   if ($inf2) { Show-Probe }
   Write-Host ''
-  Write-Host 'Send me the output above. If the Pi rebooted/bugchecked: .\pi-test.ps1 -Action Bugcheck'
+  Write-Host 'Now REBOOT (Restart-Computer) if BCM2847 shows Error / problem code 14, then run: .\pi-test.ps1 -Action Diag'
 }
 
 function Read-Bugcheck {
@@ -194,6 +204,7 @@ switch ($Action) {
   'Status'   { Show-Status }
   'Info'     { Show-Info }
   'Probe'    { Show-Probe }
+  'Rearm'    { Reset-Probe }
   'Diag'     { Invoke-Diag }
   'Bugcheck' { Read-Bugcheck }
   'Cleanup'  {

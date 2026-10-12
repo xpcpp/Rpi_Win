@@ -49,6 +49,7 @@ static VOID Put(_In_ PDEV_CTX Ctx, _In_ PCWSTR Name, _In_ ULONG Value)
     if (Ctx->Key == NULL) return;
     RtlInitUnicodeString(&n, Name);
     (VOID)WdfRegistryAssignULong(Ctx->Key, &n, Value);
+    (VOID)ZwFlushKey(WdfRegistryGetHandle(Ctx->Key));   /* survive a bugcheck right after */
 }
 
 static VOID PutStep(_In_ PDEV_CTX Ctx, _In_ PCWSTR StName, _In_ NTSTATUS St,
@@ -234,6 +235,7 @@ static VOID RunProbe(_In_ PDEV_CTX Ctx)
     PutStep(Ctx, L"Sig_St", st, L"Sig_Val", v32);
 
     Put(Ctx, L"Probe_Done", 1);
+    Put(Ctx, L"ProbeState", 2);
 }
 
 /* ---------- WDF plumbing ------------------------------------------------------ */
@@ -250,6 +252,24 @@ NTSTATUS EvtPrepareHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Raw, _In_ W
     st = WdfDeviceOpenRegistryKey(Device, PLUGPLAY_REGKEY_DEVICE, KEY_SET_VALUE | KEY_QUERY_VALUE,
                              WDF_NO_OBJECT_ATTRIBUTES, &ctx->Key);
     if (!NT_SUCCESS(st)) ctx->Key = NULL;
+
+    /*
+     * Self-disarming: ProbeState 0/absent = never ran, 1 = started but did not finish
+     * (hang / bugcheck last time), 2 = finished. If the last run did not finish we do NOT
+     * touch the card again, so a crashing probe can never cause a boot loop.
+     * Re-arm from PowerShell: set ProbeState = 0 (pi-test.ps1 -Action Rearm).
+     */
+    if (ctx->Key != NULL) {
+        UNICODE_STRING nm;
+        ULONG state = 0;
+        RtlInitUnicodeString(&nm, L"ProbeState");
+        if (NT_SUCCESS(WdfRegistryQueryULong(ctx->Key, &nm, &state)) && state == 1) {
+            Put(ctx, L"Skipped_Prev_Incomplete", 1);
+            return STATUS_SUCCESS;
+        }
+        Put(ctx, L"ProbeState", 1);
+        Put(ctx, L"Skipped_Prev_Incomplete", 0);
+    }
 
     ctx->XferBuf = (PULONG)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(ULONG), PROBE_TAG);
     if (ctx->XferBuf != NULL) {
