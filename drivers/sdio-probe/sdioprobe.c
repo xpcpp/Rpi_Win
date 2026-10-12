@@ -246,7 +246,7 @@ NTSTATUS EvtPrepareHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Raw, _In_ W
     UNREFERENCED_PARAMETER(Trans);
 
     ctx->Key = NULL;
-    st = WdfDeviceOpenRegKey(Device, PLUGPLAY_REGKEY_DEVICE, KEY_SET_VALUE | KEY_QUERY_VALUE,
+    st = WdfDeviceOpenRegistryKey(Device, PLUGPLAY_REGKEY_DEVICE, KEY_SET_VALUE | KEY_QUERY_VALUE,
                              WDF_NO_OBJECT_ATTRIBUTES, &ctx->Key);
     if (!NT_SUCCESS(st)) ctx->Key = NULL;
 
