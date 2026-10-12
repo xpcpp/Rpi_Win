@@ -1,0 +1,55 @@
+;
+; sdioprobe.inf - probe-only SDIO function driver for the Pi 4/400 WiFi chip (function 1)
+;
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4D36E97D-E325-11CE-9BFC-0800200C9A66}
+Provider=%ManufacturerName%
+CatalogFile=sdioprobe.cat
+DriverVer=01/01/2026,1.0.0.0
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+sdioprobe.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTarm64
+
+[Standard.NTarm64]
+%DeviceDesc%=SdioProbe_Device, SD\VID_02d0&PID_a9a6&FN_1
+
+[SdioProbe_Device.NT]
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+sdioprobe.sys
+
+[SdioProbe_Device.NT.Services]
+AddService=sdioprobe,%SPSVCINST_ASSOCSERVICE%,SdioProbe_Service_Inst
+
+[SdioProbe_Service_Inst]
+DisplayName    = %DeviceDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %13%\sdioprobe.sys
+
+[SdioProbe_Device.NT.Wdf]
+KmdfService = sdioprobe, SdioProbe_wdfsect
+
+[SdioProbe_wdfsect]
+KmdfLibraryVersion = 1.15
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName = "Rpi_Win"
+DiskName = "sdioprobe installation disk"
+DeviceDesc = "Raspberry Pi 4/400 SDIO WiFi function 1 (probe)"

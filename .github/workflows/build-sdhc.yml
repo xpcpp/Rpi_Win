@@ -116,24 +116,36 @@ jobs:
             "/flp2:logfile=full.log;verbosity=normal"
           exit $LASTEXITCODE
 
+      - name: Build sdioprobe (ARM64, KMDF SDIO function driver)
+        id: build_probe
+        continue-on-error: true
+        run: |
+          msbuild drivers\sdio-probe\sdioprobe.vcxproj `
+            /p:Configuration=$env:CONFIG /p:Platform=$env:PLATFORM `
+            /p:WindowsTargetPlatformVersion=$env:KIT_BUILD `
+            /p:SignMode=Off /p:EnableInf2cat=false /p:TreatWarningAsError=false /p:RunCodeAnalysis=false `
+            /p:ApiValidator_Enable=false /p:EnableInfVerif=false /p:InfVerif_Enable=false `
+            /v:m "/flp1:logfile=errors-probe.log;errorsonly;verbosity=quiet" "/flp2:logfile=full-probe.log;verbosity=normal"
+          exit $LASTEXITCODE
+
       - name: Report build errors as annotations
-        if: steps.build.outcome == 'failure'
-        shell: pwsh
+        if: steps.build.outcome == 'failure' || steps.build_probe.outcome == 'failure'
         run: |
           function Emit($title, $text) {
             $t = $text -replace '%','%25' -replace "`r",'' -replace "`n",'%0A'
             Write-Host "::error title=$title::$t"
           }
-          if (Test-Path errors.log) {
-            $e = Get-Content errors.log -Raw
-            if ($e.Length -gt 3800) { $e = $e.Substring(0,3800) }
-            Emit 'msbuild-errors' $e
-          }
-
-          if (Test-Path full.log) {
-            $l = (Get-Content full.log -Tail 45) -join "`n"
-            if ($l.Length -gt 3800) { $l = $l.Substring($l.Length-3800) }
-            Emit 'msbuild-tail' $l
+          foreach ($pair in @(@('sdhc','errors.log','full.log'), @('probe','errors-probe.log','full-probe.log'))) {
+            $name,$el,$fl = $pair
+            if (Test-Path $el) {
+              $e = Get-Content $el -Raw
+              if ($e) { if ($e.Length -gt 3800) { $e = $e.Substring(0,3800) }; Emit "msbuild-errors-$name" $e }
+            }
+            if ((Test-Path $el) -and (Get-Content $el -Raw) -and (Test-Path $fl)) {
+              $l = (Get-Content $fl -Tail 30) -join "`n"
+              if ($l.Length -gt 3500) { $l = $l.Substring($l.Length-3500) }
+              Emit "msbuild-tail-$name" $l
+            }
           }
 
       - name: Verify the driver binary was produced
@@ -144,59 +156,45 @@ jobs:
           Write-Host "Found $($sys.FullName) ($($sys.Length) bytes); build step outcome: ${{ steps.build.outcome }}"
 
       - name: Collect outputs
-        shell: pwsh
         run: |
-          New-Item -ItemType Directory dist | Out-Null
+          New-Item -ItemType Directory dist\sdhc, dist\sdiofn | Out-Null
           foreach ($n in 'bcm2836sdhc.sys','bcm2836sdhc.inf','bcm2836sdhc.pdb') {
             $f = Get-ChildItem upstream -Recurse -Filter $n |
                  Where-Object FullName -match 'ARM64' | Select-Object -First 1
             if (-not $f) { throw "missing build output: $n" }
-            Copy-Item $f.FullName dist\
+            Copy-Item $f.FullName dist\sdhc\
           }
-          Get-ChildItem dist | Format-Table Name,Length
-
-      - name: Export WDK headers for reference (release "kit-headers")
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $inc = "${env:ProgramFiles(x86)}\Windows Kits\10\Include"
-          $km = "$inc\$env:KIT_BUILD\km"
-          New-Item -ItemType Directory hdr | Out-Null
-          foreach ($n in 'ntddsd.h','sdport.h','sddef.h','sdbus.h') {
-            if (Test-Path "$km\$n") { Copy-Item "$km\$n" hdr\ }
+          foreach ($n in 'sdioprobe.sys','sdioprobe.inf','sdioprobe.pdb') {
+            $f = Get-ChildItem drivers\sdio-probe -Recurse -Filter $n -ErrorAction SilentlyContinue |
+                 Where-Object FullName -match 'ARM64' | Select-Object -First 1
+            if ($f) { Copy-Item $f.FullName dist\sdiofn\ } else { Write-Host "::warning::sdioprobe output missing: $n" }
           }
-          $kmdf = Get-ChildItem "$inc\wdf\kmdf" -Directory -ErrorAction SilentlyContinue | ForEach-Object Name
-          Set-Content hdr\kit-info.txt ("KMDF versions: " + ($kmdf -join ', ') + "`n" + ((Get-ChildItem $km -Filter 'sd*.h' | ForEach-Object Name) -join "`n"))
-          gh release delete kit-headers --yes --cleanup-tag
-          $global:LASTEXITCODE = 0
-          gh release create kit-headers (Get-ChildItem hdr\*).FullName --prerelease --target ${{ github.sha }} `
-            --title "WDK headers (reference)" --notes "Headers exported from the CI runner for driver development."
-          exit $LASTEXITCODE
+          Get-ChildItem dist -Recurse | Format-Table FullName,Length
 
-      - name: Sign (throw-away test certificate) and make catalog
+      - name: Sign (throw-away test certificate) and make catalogs
         continue-on-error: true
-        shell: pwsh
         run: |
           $cert = New-SelfSignedCertificate -Type CodeSigningCert `
             -Subject "CN=Rpi_Win CI test signing run $env:GITHUB_RUN_ID" `
             -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
             -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(30)
-
           Export-Certificate -Cert $cert -FilePath dist\rpi_win_ci_signing.cer | Out-Null
           $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\$env:KIT_BUILD"
           $signtool = "$kits\x64\signtool.exe"
           $inf2cat = "$kits\x86\Inf2Cat.exe"
           if (-not (Test-Path $signtool) -or -not (Test-Path $inf2cat)) { throw "signtool/Inf2Cat not found in $kits" }
-          & $signtool sign /fd SHA256 /sha1 $cert.Thumbprint dist\bcm2836sdhc.sys
-          $ok = $false
-          foreach ($os in '10_NI_ARM64','10_CO_ARM64','10_RS5_ARM64') {
-            & $inf2cat /driver:dist /os:$os
-            if ($LASTEXITCODE -eq 0) { $ok = $true; Write-Host "catalog OK for $os"; break }
+          foreach ($d in 'dist\sdhc','dist\sdiofn') {
+            $sys = Get-ChildItem $d -Filter *.sys -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $sys) { Write-Host "skip $d (no .sys)"; continue }
+            & $signtool sign /fd SHA256 /sha1 $cert.Thumbprint $sys.FullName
+            $ok = $false
+            foreach ($os in '10_NI_ARM64','10_CO_ARM64','10_RS5_ARM64') {
+              & $inf2cat /driver:$d /os:$os
+              if ($LASTEXITCODE -eq 0) { $ok = $true; Write-Host "catalog OK for $d ($os)"; break }
+            }
+            if (-not $ok) { throw "Inf2Cat failed for $d" }
+            Get-ChildItem $d -Filter *.cat | ForEach-Object { & $signtool sign /fd SHA256 /sha1 $cert.Thumbprint $_.FullName }
           }
-
-          if (-not $ok) { throw "Inf2Cat failed for all OS tokens" }
-          & $signtool sign /fd SHA256 /sha1 $cert.Thumbprint dist\bcm2836sdhc.cat
 
       - name: Upload driver package
         uses: actions/upload-artifact@v4

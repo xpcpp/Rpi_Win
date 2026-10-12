@@ -8,11 +8,12 @@
    .\pi-test.ps1 -Action Info        # hardware/compatible IDs + problem codes of the SDIO (WiFi) devices
 
  If scripts are blocked:  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+   .\pi-test.ps1 -Action Probe       # print what the SDIO probe driver found (chip signature etc.)
    .\pi-test.ps1 -Action Bugcheck    # decode the last bugcheck (storm-guard registers)
    .\pi-test.ps1 -Action Cleanup     # remove driver package(s) and test certs
 #>
 param(
-  [ValidateSet('Install','Status','Info','Bugcheck','Cleanup')][string]$Action = 'Status',
+  [ValidateSet('Install','Status','Info','Probe','Bugcheck','Cleanup')][string]$Action = 'Status',
   [string]$Repo = 'xpcpp/Rpi_Win',
   [string]$Tag  = 'ci-latest',
   [switch]$Yes
@@ -54,9 +55,30 @@ function Remove-SdhcPackages {
   $cur = $null
   pnputil /enum-drivers | ForEach-Object {
     if ($_ -match 'Published Name:\s+(oem\d+\.inf)') { $cur = $Matches[1] }
-    if ($_ -match 'Original Name:\s+bcm2836sdhc\.inf' -and $cur) {
-      Write-Host "Removing $cur"
+    if ($_ -match 'Original Name:\s+(bcm2836sdhc|sdioprobe)\.inf' -and $cur) {
+      Write-Host "Removing $cur ($($Matches[1]))"
       pnputil /delete-driver $cur /uninstall /force | Out-Host
+    }
+  }
+}
+
+function Show-Probe {
+  $root = 'HKLM:\SYSTEM\CurrentControlSet\Enum\SD\VID_02D0&PID_A9A6&FN_1'
+  if (-not (Test-Path $root)) { Write-Host 'FN_1 device key not found.'; return }
+  foreach ($inst in Get-ChildItem $root) {
+    $k = Join-Path $inst.PSPath 'Device Parameters'
+    Write-Host "== $($inst.PSChildName)"
+    if (-not (Test-Path $k)) { Write-Host '  (no Device Parameters: sdioprobe has not run)'; continue }
+    $p = Get-ItemProperty $k
+    $names = $p.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | Sort-Object Name
+    foreach ($n in $names) {
+      if ($n.Value -is [int] -or $n.Value -is [uint32]) { Write-Host ('  {0,-14} = 0x{1:X8}' -f $n.Name, [uint32]$n.Value) }
+      else { Write-Host ('  {0,-14} = {1}' -f $n.Name, $n.Value) }
+    }
+    $sig = $p.Sig_Val
+    if ($null -ne $sig) {
+      if ([uint32]$sig -eq 0x15294345) { Write-Host '  >>> chip signature matches Linux (0x15294345): SDIO data path WORKS' }
+      else { Write-Host ('  >>> chip signature = 0x{0:X8} (Linux saw 0x15294345)' -f [uint32]$sig) }
     }
   }
 }
@@ -84,6 +106,7 @@ function Install-CiDriver {
   Expand-Archive "$dir\pkg.zip" -DestinationPath "$dir\pkg" -Force
 
   $inf = Get-ChildItem "$dir\pkg" -Recurse -Filter bcm2836sdhc.inf | Select-Object -First 1
+  $inf2 = Get-ChildItem "$dir\pkg" -Recurse -Filter sdioprobe.inf | Select-Object -First 1
   $cer = Get-ChildItem "$dir\pkg" -Recurse -Filter *.cer | Select-Object -First 1
   if (-not $inf -or -not $cer) { throw 'package is missing bcm2836sdhc.inf or the .cer' }
 
@@ -98,9 +121,15 @@ function Install-CiDriver {
 
   pnputil /add-driver $inf.FullName /install | Out-Host
   Start-Sleep -Seconds 15
+  if ($inf2) {
+    Write-Host 'Installing sdioprobe (SDIO function driver)...'
+    pnputil /add-driver $inf2.FullName /install | Out-Host
+    Start-Sleep -Seconds 10
+  } else { Write-Host 'No sdioprobe package in this build.' }
   Show-Status
+  if ($inf2) { Show-Probe }
   Write-Host ''
-  Write-Host 'If the Pi rebooted/bugchecked: run  .\pi-test.ps1 -Action Bugcheck  and send the output.'
+  Write-Host 'Send me the output above. If the Pi rebooted/bugchecked: .\pi-test.ps1 -Action Bugcheck'
 }
 
 function Read-Bugcheck {
@@ -133,6 +162,7 @@ switch ($Action) {
   'Install'  { Install-CiDriver }
   'Status'   { Show-Status }
   'Info'     { Show-Info }
+  'Probe'    { Show-Probe }
   'Bugcheck' { Read-Bugcheck }
   'Cleanup'  {
     if (-not (Test-Admin)) { throw 'Run this from an elevated PowerShell.' }
