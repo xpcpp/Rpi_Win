@@ -16,7 +16,7 @@
 #include <ntddsd.h>
 
 #define PROBE_TAG 'bPdS'
-#define PROBE_VERSION 3
+#define PROBE_VERSION 4
 
 typedef struct _DEV_CTX {
     PDEVICE_OBJECT           Self;
@@ -28,6 +28,7 @@ typedef struct _DEV_CTX {
     NTSTATUS                 OpenSt;
     NTSTATUS                 InitSt;
     UCHAR                    Fn;
+    BOOLEAN                  BlockOk;
     HANDLE                   Key;
     PULONG                   XferBuf;
     PMDL                     XferMdl;
@@ -137,6 +138,17 @@ static NTSTATUS GetProp(_In_ PDEV_CTX Ctx, _In_ SDBUS_PROPERTY Prop, _In_ PVOID 
     SDBUS_REQUEST_PACKET p;
     RtlZeroMemory(&p, sizeof(p));
     p.RequestFunction = SDRF_GET_PROPERTY;
+    p.Parameters.GetSetProperty.Property = Prop;
+    p.Parameters.GetSetProperty.Buffer   = Buf;
+    p.Parameters.GetSetProperty.Length   = Len;
+    return SdBusSubmitRequest(Ctx->Bus.Context, &p);
+}
+
+static NTSTATUS SetProp(_In_ PDEV_CTX Ctx, _In_ SDBUS_PROPERTY Prop, _In_ PVOID Buf, _In_ ULONG Len)
+{
+    SDBUS_REQUEST_PACKET p;
+    RtlZeroMemory(&p, sizeof(p));
+    p.RequestFunction = SDRF_SET_PROPERTY;
     p.Parameters.GetSetProperty.Property = Prop;
     p.Parameters.GetSetProperty.Buffer   = Buf;
     p.Parameters.GetSetProperty.Length   = Len;
@@ -291,6 +303,18 @@ static VOID RunProbe(_In_ PDEV_CTX Ctx)
         PutStep(Ctx, L"Rdy_St", STATUS_SUCCESS, L"Rdy_Val", rdy);
     }
 
+    /* --- function block size: Linux/brcmfmac sets 64 on F1 before any CMD53.
+     *     v3 showed P_FnBlk = 0 and a divide-by-zero bugcheck (0x7E, 0xC0000094) on the first CMD53. --- */
+    {
+        USHORT want = 64, got = 0;
+        NTSTATUS sset, sget;
+        sset = SetProp(Ctx, SDP_FUNCTION_BLOCK_LENGTH, &want, sizeof(want));
+        PutStep(Ctx, L"BlkSet_St", sset, L"BlkSet_Val", want);
+        sget = GetProp(Ctx, SDP_FUNCTION_BLOCK_LENGTH, &got, sizeof(got));
+        PutStep(Ctx, L"BlkRd_St", sget, L"BlkRd_Val", got);
+        Ctx->BlockOk = (NT_SUCCESS(sget) && got != 0) ? TRUE : FALSE;
+    }
+
     /* --- backplane window -> 0x18000000 (ChipCommon), then read the 32-bit chip id --- */
     st = Cmd52(Ctx, fn, 0x1000A, TRUE, (UCHAR)((0x18000000UL >> 8)  & 0x80), &b);
     PutStep(Ctx, L"WinLo_St", st, L"WinLo_Val", b);
@@ -300,8 +324,13 @@ static VOID RunProbe(_In_ PDEV_CTX Ctx)
     PutStep(Ctx, L"WinHi_St", st, L"WinHi_Val", b);
 
     /* offset 0 inside the window, 32-bit access flag (bit 15) */
-    st = Cmd53Read32(Ctx, fn, 0x8000, &v32);
-    PutStep(Ctx, L"Sig_St", st, L"Sig_Val", v32);
+    if (!Ctx->BlockOk) {
+        /* never issue CMD53 with a zero function block size (divide-by-zero crash seen in v3) */
+        PutStep(Ctx, L"Sig_St", (NTSTATUS)0xDEAD0001, L"Sig_Val", 0);
+    } else {
+        st = Cmd53Read32(Ctx, fn, 0x8000, &v32);
+        PutStep(Ctx, L"Sig_St", st, L"Sig_Val", v32);
+    }
 
     Put(Ctx, L"Probe_Done", 1);
     Put(Ctx, L"ProbeState", 2);
