@@ -41,7 +41,7 @@ Invoke-WebRequest -UseBasicParsing -Headers $h -Uri "https://api.github.com/repo
 $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$Root\agent.ps1`""
 $t1  = New-ScheduledTaskTrigger -AtStartup
 $t2  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
-$set = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
+$set = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
 $pri = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 Unregister-ScheduledTask -TaskName 'rpiwin-agent' -Confirm:$false -ErrorAction SilentlyContinue
 Register-ScheduledTask -TaskName 'rpiwin-agent' -Action $act -Trigger @($t1,$t2) -Settings $set -Principal $pri | Out-Null

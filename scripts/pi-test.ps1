@@ -99,6 +99,27 @@ function Show-Probe {
   }
 }
 
+function Update-Agent {
+  # Called from Diag: refreshes C:\rpiwin-agent\agent.ps1 from the repo (syntax-checked, with .bak). Same repo that already supplies this script.
+  $root = 'C:\rpiwin-agent'
+  if (-not (Test-Path "$root\token.txt") -or -not (Test-Path "$root\config.json")) { return }
+  try {
+    $tok = (Get-Content "$root\token.txt" -Raw).Trim()
+    $cfg = Get-Content "$root\config.json" -Raw | ConvertFrom-Json
+    $h = @{ Authorization = "Bearer $tok"; Accept = 'application/vnd.github.raw'; 'User-Agent' = 'pi-test' }
+    $tmp = "$root\agent.ps1.new"
+    Invoke-WebRequest -UseBasicParsing -Headers $h -Uri "https://api.github.com/repos/$($cfg.repo)/contents/agent/agent.ps1" -OutFile $tmp
+    $tk = $null; $er = $null
+    [System.Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$tk, [ref]$er) | Out-Null
+    if ($er.Count -gt 0) { Write-Host 'agent update: parse errors, not applied'; Remove-Item $tmp -Force; return }
+    if ((Get-FileHash $tmp).Hash -ne (Get-FileHash "$root\agent.ps1").Hash) {
+      Copy-Item "$root\agent.ps1" "$root\agent.ps1.bak" -Force
+      Move-Item $tmp "$root\agent.ps1" -Force
+      Write-Host 'agent update: agent.ps1 replaced (takes effect on its next start)'
+    } else { Remove-Item $tmp -Force; Write-Host 'agent update: already current' }
+  } catch { Write-Host "agent update failed: $($_.Exception.Message)" }
+}
+
 function Invoke-Diag {
   $out = Join-Path (Get-Location) 'diag.txt'
   & {
@@ -233,7 +254,7 @@ switch ($Action) {
   'Info'     { Show-Info }
   'Probe'    { Show-Probe }
   'Rearm'    { Reset-Probe }
-  'Diag'     { Invoke-Diag }
+  'Diag'     { Update-Agent; Invoke-Diag }
   'Bugcheck' { Read-Bugcheck }
   'Cleanup'  {
     if (-not (Test-Admin)) { throw 'Run this from an elevated PowerShell.' }
