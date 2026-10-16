@@ -14,9 +14,10 @@
 #include <ntddk.h>
 #include <initguid.h>   /* instantiate GUID_SDBUS_INTERFACE_STANDARD for sdbus.lib */
 #include <ntddsd.h>
+#include <ntstrsafe.h>
 
 #define PROBE_TAG 'bPdS'
-#define PROBE_VERSION 4
+#define PROBE_VERSION 5
 
 typedef struct _DEV_CTX {
     PDEVICE_OBJECT           Self;
@@ -29,6 +30,8 @@ typedef struct _DEV_CTX {
     NTSTATUS                 InitSt;
     UCHAR                    Fn;
     BOOLEAN                  BlockOk;
+    BOOLEAN                  WinValid;
+    ULONG                    CurWin;
     HANDLE                   Key;
     PULONG                   XferBuf;
     PMDL                     XferMdl;
@@ -216,6 +219,185 @@ static VOID Delay100ms(VOID)
 
 /* ---------- the probe -------------------------------------------------------- */
 
+
+/* ---------- M3a: backplane access, clock init, core enumeration (read-only) ---- */
+
+#define F1_SBADDRLOW   0x1000A
+#define F1_SBADDRMID   0x1000B
+#define F1_SBADDRHIGH  0x1000C
+#define F1_CHIPCLKCSR  0x1000E
+#define F1_SDIOPULLUP  0x1000F
+#define CLK_FORCE_ALP          0x01
+#define CLK_ALP_AVAIL_REQ      0x08
+#define CLK_FORCE_HW_CLKREQ_OFF 0x20
+#define CLK_ALP_AVAIL          0x40
+#define CLK_HT_AVAIL           0x80
+#define SI_ENUM_BASE           0x18000000UL
+
+static NTSTATUS BpSetWindow(_In_ PDEV_CTX c, _In_ ULONG addr)
+{
+    ULONG bar = addr & 0xFFFF8000UL;
+    UCHAR b;
+    NTSTATUS st;
+
+    if (c->WinValid && c->CurWin == bar) return STATUS_SUCCESS;
+    st = Cmd52(c, c->Fn, F1_SBADDRLOW,  TRUE, (UCHAR)((bar >> 8)  & 0x80), &b);
+    if (!NT_SUCCESS(st)) return st;
+    st = Cmd52(c, c->Fn, F1_SBADDRMID,  TRUE, (UCHAR)((bar >> 16) & 0xFF), &b);
+    if (!NT_SUCCESS(st)) return st;
+    st = Cmd52(c, c->Fn, F1_SBADDRHIGH, TRUE, (UCHAR)((bar >> 24) & 0xFF), &b);
+    if (!NT_SUCCESS(st)) return st;
+    c->CurWin = bar;
+    c->WinValid = TRUE;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS BpRead32(_In_ PDEV_CTX c, _In_ ULONG addr, _Out_ PULONG v)
+{
+    NTSTATUS st = BpSetWindow(c, addr);
+    *v = 0;
+    if (!NT_SUCCESS(st)) return st;
+    return Cmd53Read32(c, c->Fn, (addr & 0x7FFF) | 0x8000, v);   /* bit 15 = 32-bit access */
+}
+
+static VOID PutIdx(_In_ PDEV_CTX c, _In_ ULONG i, _In_ PCWSTR suffix, _In_ ULONG val)
+{
+    WCHAR name[32];
+    if (NT_SUCCESS(RtlStringCchPrintfW(name, RTL_NUMBER_OF(name), L"Core%u_%ws", i, suffix))) Put(c, name, val);
+}
+
+/* Port of brcmf_sdio_buscoreprep(): ask for ALP, wait for it, force ALP, drop pull-ups. */
+static VOID ClockInit(_In_ PDEV_CTX c)
+{
+    NTSTATUS st;
+    UCHAR b = 0, clk = 0;
+    ULONG i;
+
+    Put(c, L"Stage", 10);
+    st = Cmd52(c, c->Fn, F1_CHIPCLKCSR, TRUE, CLK_FORCE_HW_CLKREQ_OFF | CLK_ALP_AVAIL_REQ, &b);
+    PutStep(c, L"Clk_Wr_St", st, L"Clk_Wr_Val", CLK_FORCE_HW_CLKREQ_OFF | CLK_ALP_AVAIL_REQ);
+    if (!NT_SUCCESS(st)) return;
+
+    st = Cmd52(c, c->Fn, F1_CHIPCLKCSR, FALSE, 0, &clk);
+    PutStep(c, L"Clk_Rd_St", st, L"Clk_Rd_Val", clk);
+
+    for (i = 0; i < 1000; i++) {                       /* up to ~1 s, 1 ms steps */
+        st = Cmd52(c, c->Fn, F1_CHIPCLKCSR, FALSE, 0, &clk);
+        if (NT_SUCCESS(st) && (clk & (CLK_ALP_AVAIL | CLK_HT_AVAIL))) break;
+        {   LARGE_INTEGER t; t.QuadPart = -10 * 1000; KeDelayExecutionThread(KernelMode, FALSE, &t); }
+    }
+    PutStep(c, L"Alp_St", st, L"Alp_Val", clk);
+    if (!(clk & (CLK_ALP_AVAIL | CLK_HT_AVAIL))) return;
+
+    st = Cmd52(c, c->Fn, F1_CHIPCLKCSR, TRUE, CLK_FORCE_HW_CLKREQ_OFF | CLK_FORCE_ALP, &b);
+    PutStep(c, L"ForceAlp_St", st, L"ForceAlp_Val", CLK_FORCE_HW_CLKREQ_OFF | CLK_FORCE_ALP);
+    {   LARGE_INTEGER t; t.QuadPart = -10 * 1000; KeDelayExecutionThread(KernelMode, FALSE, &t); }
+    st = Cmd52(c, c->Fn, F1_SDIOPULLUP, TRUE, 0, &b);
+    PutStep(c, L"Pullup_St", st, L"Pullup_Val", 0);
+}
+
+/* EROM walker, ported from brcmf_chip_dmp_get_desc / _get_regaddr / _erom_scan. */
+static NTSTATUS EromGet(_In_ PDEV_CTX c, _Inout_ PULONG ea, _Out_ PULONG val, _Out_opt_ PUCHAR type)
+{
+    NTSTATUS st = BpRead32(c, *ea, val);
+    *ea += 4;
+    if (!NT_SUCCESS(st)) return st;
+    if (type != NULL) {
+        *type = (UCHAR)(*val & 0xF);
+        if ((*type & ~0x8) == 0x5) *type = 0x5;          /* address descriptor (32 or 64-bit) */
+    }
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS EromRegAddr(_In_ PDEV_CTX c, _Inout_ PULONG ea, _Out_ PULONG regbase, _Out_ PULONG wrapbase, _Out_ PBOOLEAN ok)
+{
+    UCHAR desc = 0, wraptype, stype, sztype;
+    ULONG val, tmp, szdesc, guard = 0;
+    NTSTATUS st;
+
+    *regbase = 0; *wrapbase = 0; *ok = FALSE;
+
+    st = EromGet(c, ea, &val, &desc);
+    if (!NT_SUCCESS(st)) return st;
+    if (desc == 0x3)      { wraptype = 3; }                          /* master port -> MWRAP */
+    else if (desc == 0x5) { *ea -= 4; wraptype = 2; }                /* address     -> SWRAP */
+    else                  { *ea -= 4; return STATUS_SUCCESS; }       /* unexpected  -> not ok */
+
+    do {
+        do {
+            st = EromGet(c, ea, &val, &desc);
+            if (!NT_SUCCESS(st)) return st;
+            if (desc == 0xF) { *ea -= 4; return STATUS_SUCCESS; }    /* unexpected table end */
+            if (++guard > 512) return STATUS_SUCCESS;
+        } while (desc != 0x5 && desc != 0x1);
+
+        if (desc == 0x1) { *ea -= 4; *ok = TRUE; return STATUS_SUCCESS; }   /* next component reached */
+
+        if (val & 0x8) { st = EromGet(c, ea, &tmp, NULL); if (!NT_SUCCESS(st)) return st; }
+        sztype = (UCHAR)((val & 0x30) >> 4);
+        if (sztype == 3) {
+            st = EromGet(c, ea, &szdesc, NULL);
+            if (!NT_SUCCESS(st)) return st;
+            if (szdesc & 0x8) { st = EromGet(c, ea, &tmp, NULL); if (!NT_SUCCESS(st)) return st; }
+        }
+        if (sztype != 0 && sztype != 1) continue;          /* only 4K / 8K regions */
+
+        stype = (UCHAR)((val & 0xC0) >> 6);
+        if (*regbase == 0 && stype == 0)        *regbase  = val & 0xFFFFF000UL;
+        if (*wrapbase == 0 && stype == wraptype) *wrapbase = val & 0xFFFFF000UL;
+    } while (*regbase == 0 || *wrapbase == 0);
+
+    *ok = TRUE;
+    return STATUS_SUCCESS;
+}
+
+static VOID EromScan(_In_ PDEV_CTX c)
+{
+    ULONG ea = 0, val, id, nmw, nsw, rev, base, wrap, ncores = 0, guard = 0;
+    UCHAR type = 0;
+    BOOLEAN ok;
+    NTSTATUS st;
+
+    Put(c, L"Stage", 20);
+    st = BpRead32(c, SI_ENUM_BASE + 0xFC, &ea);               /* chipcommon.eromptr */
+    PutStep(c, L"Erom_St", st, L"Erom_Ptr", ea);
+    if (!NT_SUCCESS(st) || ea == 0 || ea == 0xFFFFFFFF) return;
+
+    Put(c, L"Stage", 21);
+    while (type != 0xF && ++guard < 4096) {
+        st = EromGet(c, &ea, &val, &type);
+        if (!NT_SUCCESS(st)) break;
+        if (!(val & 0x1)) continue;                            /* DMP_DESC_VALID */
+        if (type != 0x1) continue;                             /* need a component descriptor */
+
+        id = (val & 0x000FFF00UL) >> 8;
+        st = EromGet(c, &ea, &val, &type);
+        if (!NT_SUCCESS(st)) break;
+        if ((val & 0xF) != 0x1) break;                         /* next must be a component too */
+
+        nmw = (val & 0x0007C000UL) >> 14;
+        nsw = (val & 0x00F80000UL) >> 19;
+        rev = (val & 0xFF000000UL) >> 24;
+        if (nmw + nsw == 0 && id != 0x827 && id != 0x840) continue;   /* only cores with ports (+PMU, GCI) */
+
+        st = EromRegAddr(c, &ea, &base, &wrap, &ok);
+        if (!NT_SUCCESS(st)) break;
+        if (!ok) continue;
+
+        if (ncores < 16) {
+            PutIdx(c, ncores, L"Id", id);
+            PutIdx(c, ncores, L"Base", base);
+            PutIdx(c, ncores, L"Wrap", wrap);
+            PutIdx(c, ncores, L"Rev", rev);
+        }
+        ncores++;
+    }
+    Put(c, L"Cores_N", ncores);
+    Put(c, L"Erom_End", ea);
+    Put(c, L"Stage", 29);
+}
+
+
 static VOID RunProbe(_In_ PDEV_CTX Ctx)
 {
     NTSTATUS st;
@@ -330,6 +512,11 @@ static VOID RunProbe(_In_ PDEV_CTX Ctx)
     } else {
         st = Cmd53Read32(Ctx, fn, 0x8000, &v32);
         PutStep(Ctx, L"Sig_St", st, L"Sig_Val", v32);
+        if (NT_SUCCESS(st) && v32 != 0 && v32 != 0xFFFFFFFF) {
+            Ctx->WinValid = FALSE;              /* window was programmed outside BpSetWindow */
+            ClockInit(Ctx);                     /* M3a: ALP clock like brcmf_sdio_buscoreprep */
+            EromScan(Ctx);                      /* M3a: list the SoC cores (read-only)        */
+        }
     }
 
     Put(Ctx, L"Probe_Done", 1);
