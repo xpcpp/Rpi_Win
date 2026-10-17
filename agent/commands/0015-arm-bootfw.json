@@ -1,0 +1,4 @@
+{
+ "action": "ps",
+ "script": "$root = 'HKLM:\\SYSTEM\\CurrentControlSet\\Enum\\SD\\VID_02D0&PID_A9A6&FN_1'\nforeach ($i in Get-ChildItem $root) {\n  $k = Join-Path $i.PSPath 'Device Parameters'\n  if (-not (Test-Path $k)) { New-Item $k -Force | Out-Null }\n  Set-ItemProperty $k -Name BootFw -Value 1 -Type DWord\n  Set-ItemProperty $k -Name ProbeState -Value 0 -Type DWord\n  \"armed: $($i.PSChildName)  BootFw=\" + (Get-ItemProperty $k).BootFw\n}"
+}
