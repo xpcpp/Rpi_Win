@@ -13,7 +13,7 @@
 +//   Param1 = INTERRUPT_ERROR_STATUS (0x30)   Param2 = STATUS_ENABLE (0x34)
 +//   Param3 = SIGNAL_ENABLE (0x38)            Param4 = PRESENT_STATE (0x24)
 +//
-+#define SDHC_STORM_LIMIT            20000
++#define SDHC_STORM_LIMIT            300000
 +#define SDHC_STORM_WINDOW_100NS     10000000LL
 +#define SDHC_BUGCHECK_ON_STORM      1
 +#define SDHC_STORM_BUGCHECK_CODE    0x5D0C0001
