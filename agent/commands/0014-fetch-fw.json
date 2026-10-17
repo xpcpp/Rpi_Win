@@ -1,0 +1,5 @@
+{
+ "action": "ps",
+ "timeout_sec": 300,
+ "script": "New-Item -ItemType Directory -Force C:\\rpiwin\\fw | Out-Null\n[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12\n$base = 'https://raw.githubusercontent.com/RPi-Distro/firmware-nonfree/trixie/debian/added-firmware/brcm/'\nforeach ($n in 'brcmfmac43456-sdio.bin','brcmfmac43456-sdio.txt') {\n  $dst = \"C:\\rpiwin\\fw\\$n\"\n  Invoke-WebRequest -UseBasicParsing \"$base$n\" -OutFile $dst -TimeoutSec 120\n  $f = Get-Item $dst\n  \"{0}  {1} bytes  sha256={2}\" -f $n, $f.Length, (Get-FileHash $dst -Algorithm SHA256).Hash\n}"
+}
