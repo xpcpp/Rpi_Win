@@ -17,7 +17,7 @@
 #include <ntstrsafe.h>
 
 #define PROBE_TAG 'bPdS'
-#define PROBE_VERSION 5
+#define PROBE_VERSION 6
 
 typedef struct _DEV_CTX {
     PDEVICE_OBJECT           Self;
@@ -32,6 +32,12 @@ typedef struct _DEV_CTX {
     BOOLEAN                  BlockOk;
     BOOLEAN                  WinValid;
     ULONG                    CurWin;
+    PUCHAR                   Bounce;       /* 512-byte non-paged bounce buffer for CMD53 bulk transfers */
+    PMDL                     BounceMdl;
+    ULONG                    NCores;
+    ULONG                    CoreId[16];
+    ULONG                    CoreBase[16];
+    ULONG                    CoreWrap[16];
     HANDLE                   Key;
     PULONG                   XferBuf;
     PMDL                     XferMdl;
@@ -385,6 +391,7 @@ static VOID EromScan(_In_ PDEV_CTX c)
         if (!ok) continue;
 
         if (ncores < 16) {
+            c->CoreId[ncores] = id; c->CoreBase[ncores] = base; c->CoreWrap[ncores] = wrap;
             PutIdx(c, ncores, L"Id", id);
             PutIdx(c, ncores, L"Base", base);
             PutIdx(c, ncores, L"Wrap", wrap);
@@ -392,9 +399,334 @@ static VOID EromScan(_In_ PDEV_CTX c)
         }
         ncores++;
     }
+    c->NCores = (ncores < 16) ? ncores : 16;
     Put(c, L"Cores_N", ncores);
     Put(c, L"Erom_End", ea);
     Put(c, L"Stage", 29);
+}
+
+
+
+/* ---------- M3b: firmware + NVRAM download, ARM CR4 start (one-shot, BootFw=1) ---- */
+
+#define BCMA_IOCTL        0x408
+#define BCMA_RESET_CTL    0x800
+#define BCMA_IOCTL_CLK    0x0001
+#define BCMA_IOCTL_FGC    0x0002
+#define CR4_IOCTL_CPUHALT 0x0020
+#define D11_PHYRESET      0x0008
+#define D11_PHYCLKEN      0x0004
+#define CORE_D11          0x812
+#define CORE_CR4          0x83E
+#define CORE_SDIODEV      0x829
+#define RAMBASE_4345      0x198000UL
+#define RAM_CHUNK         64
+
+static NTSTATUS Cmd53Bounce(_In_ PDEV_CTX c, _In_ UCHAR fn, _In_ ULONG addr, _In_ ULONG len, _In_ BOOLEAN write)
+{
+    static const SDCMD_DESCRIPTOR dRead  = { SDCMD_IO_RW_EXTENDED, SDCC_STANDARD, SDTD_READ,  SDTT_SINGLE_BLOCK, SDRT_5 };
+    static const SDCMD_DESCRIPTOR dWrite = { SDCMD_IO_RW_EXTENDED, SDCC_STANDARD, SDTD_WRITE, SDTT_SINGLE_BLOCK, SDRT_5 };
+    SDBUS_REQUEST_PACKET p;
+    SD_RW_EXTENDED_ARGUMENT a;
+
+    RtlZeroMemory(&p, sizeof(p));
+    a.u.AsULONG = 0;
+    a.u.bits.Function = fn;
+    a.u.bits.Address  = addr;
+    a.u.bits.OpCode   = 1;
+    a.u.bits.BlockMode = 0;
+    a.u.bits.WriteToDevice = write ? 1 : 0;
+    a.u.bits.Count    = (len >= 512) ? 0 : len;
+    p.RequestFunction = SDRF_DEVICE_COMMAND;
+    p.Parameters.DeviceCommand.CmdDesc  = write ? dWrite : dRead;
+    p.Parameters.DeviceCommand.Argument = a.u.AsULONG;
+    p.Parameters.DeviceCommand.Mdl      = c->BounceMdl;
+    p.Parameters.DeviceCommand.Length   = len;
+    return SdBusSubmitRequest(c->Bus.Context, &p);
+}
+
+static NTSTATUS BpWrite32(_In_ PDEV_CTX c, _In_ ULONG addr, _In_ ULONG val)
+{
+    NTSTATUS st = BpSetWindow(c, addr);
+    if (!NT_SUCCESS(st)) return st;
+    *(PULONG)c->Bounce = val;
+    return Cmd53Bounce(c, c->Fn, (addr & 0x7FFF) | 0x8000, 4, TRUE);
+}
+
+static NTSTATUS RamWrite(_In_ PDEV_CTX c, _In_ ULONG addr, _In_reads_bytes_(len) const UCHAR *data, _In_ ULONG len)
+{
+    while (len != 0) {
+        ULONG off = addr & 0x7FFF, n = 0x8000 - off;
+        NTSTATUS st;
+        if (n > len) n = len;
+        if (n > RAM_CHUNK) n = RAM_CHUNK;
+        st = BpSetWindow(c, addr);
+        if (!NT_SUCCESS(st)) return st;
+        RtlCopyMemory(c->Bounce, data, n);
+        st = Cmd53Bounce(c, c->Fn, off, n, TRUE);
+        if (!NT_SUCCESS(st)) return st;
+        addr += n; data += n; len -= n;
+    }
+    return STATUS_SUCCESS;
+}
+
+/* returns STATUS_SUCCESS and *Bad = 0xFFFFFFFF when identical, else *Bad = first mismatch offset */
+static NTSTATUS RamVerify(_In_ PDEV_CTX c, _In_ ULONG addr, _In_reads_bytes_(len) const UCHAR *data, _In_ ULONG len, _Out_ PULONG Bad)
+{
+    ULONG done = 0;
+    *Bad = 0xFFFFFFFF;
+    while (done < len) {
+        ULONG a = addr + done, off = a & 0x7FFF, n = 0x8000 - off;
+        NTSTATUS st;
+        if (n > len - done) n = len - done;
+        if (n > RAM_CHUNK) n = RAM_CHUNK;
+        st = BpSetWindow(c, a);
+        if (!NT_SUCCESS(st)) return st;
+        st = Cmd53Bounce(c, c->Fn, off, n, FALSE);
+        if (!NT_SUCCESS(st)) return st;
+        if (RtlCompareMemory(c->Bounce, data + done, n) != n) {
+            ULONG k = (ULONG)RtlCompareMemory(c->Bounce, data + done, n);
+            *Bad = done + k;
+            return STATUS_SUCCESS;
+        }
+        done += n;
+    }
+    return STATUS_SUCCESS;
+}
+
+static VOID CoreDisable(_In_ PDEV_CTX c, _In_ ULONG wrap, _In_ ULONG pre, _In_ ULONG reset)
+{
+    ULONG v = 0, i;
+    (VOID)BpRead32(c, wrap + BCMA_RESET_CTL, &v);
+    if ((v & 1) == 0) {
+        (VOID)BpWrite32(c, wrap + BCMA_IOCTL, pre | BCMA_IOCTL_FGC | BCMA_IOCTL_CLK);
+        (VOID)BpRead32(c, wrap + BCMA_IOCTL, &v);
+        (VOID)BpWrite32(c, wrap + BCMA_RESET_CTL, 1);
+        KeStallExecutionProcessor(15);
+        for (i = 0; i < 30; i++) {
+            (VOID)BpRead32(c, wrap + BCMA_RESET_CTL, &v);
+            if (v == 1) break;
+            KeStallExecutionProcessor(10);
+        }
+    }
+    (VOID)BpWrite32(c, wrap + BCMA_IOCTL, reset | BCMA_IOCTL_FGC | BCMA_IOCTL_CLK);
+    (VOID)BpRead32(c, wrap + BCMA_IOCTL, &v);
+}
+
+static VOID CoreReset(_In_ PDEV_CTX c, _In_ ULONG wrap, _In_ ULONG pre, _In_ ULONG reset, _In_ ULONG post)
+{
+    ULONG v = 0, count = 0;
+    CoreDisable(c, wrap, pre, reset);
+    for (;;) {
+        (VOID)BpRead32(c, wrap + BCMA_RESET_CTL, &v);
+        if ((v & 1) == 0) break;
+        (VOID)BpWrite32(c, wrap + BCMA_RESET_CTL, 0);
+        if (++count > 50) break;
+        KeStallExecutionProcessor(50);
+    }
+    (VOID)BpWrite32(c, wrap + BCMA_IOCTL, post | BCMA_IOCTL_CLK);
+    (VOID)BpRead32(c, wrap + BCMA_IOCTL, &v);
+}
+
+static BOOLEAN FindCore(_In_ PDEV_CTX c, _In_ ULONG id, _In_ ULONG nth, _Out_ PULONG base, _Out_ PULONG wrap)
+{
+    ULONG i, seen = 0;
+    for (i = 0; i < c->NCores; i++) {
+        if (c->CoreId[i] == id) {
+            if (seen == nth) { *base = c->CoreBase[i]; *wrap = c->CoreWrap[i]; return TRUE; }
+            seen++;
+        }
+    }
+    return FALSE;
+}
+
+static NTSTATUS ReadFileAll(_In_ PCWSTR path, _Outptr_ PUCHAR *out, _Out_ PULONG outLen)
+{
+    UNICODE_STRING us;
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK iosb;
+    FILE_STANDARD_INFORMATION fsi;
+    HANDLE h = NULL;
+    PUCHAR buf;
+    ULONG size;
+    NTSTATUS st;
+
+    *out = NULL; *outLen = 0;
+    RtlInitUnicodeString(&us, path);
+    InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    st = ZwCreateFile(&h, GENERIC_READ | SYNCHRONIZE, &oa, &iosb, NULL, FILE_ATTRIBUTE_NORMAL,
+                      FILE_SHARE_READ, FILE_OPEN, FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE, NULL, 0);
+    if (!NT_SUCCESS(st)) return st;
+    st = ZwQueryInformationFile(h, &iosb, &fsi, sizeof(fsi), FileStandardInformation);
+    if (!NT_SUCCESS(st)) { ZwClose(h); return st; }
+    if (fsi.EndOfFile.QuadPart <= 0 || fsi.EndOfFile.QuadPart > 0x400000) { ZwClose(h); return STATUS_FILE_INVALID; }
+    size = (ULONG)fsi.EndOfFile.QuadPart;
+    buf = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, size + 64, PROBE_TAG);
+    if (buf == NULL) { ZwClose(h); return STATUS_INSUFFICIENT_RESOURCES; }
+    st = ZwReadFile(h, NULL, NULL, NULL, &iosb, buf, size, NULL, NULL);
+    ZwClose(h);
+    if (!NT_SUCCESS(st)) { ExFreePoolWithTag(buf, PROBE_TAG); return st; }
+    *out = buf; *outLen = size;
+    return STATUS_SUCCESS;
+}
+
+static BOOLEAN IsNvChar(UCHAR ch) { return (ch >= 0x20 && ch < 0x7f && ch != '#'); }
+
+/* simplified brcmf_fw_nvram_strip(): "key=value" lines -> NUL separated list, padded to 4, + length token */
+static NTSTATUS BuildNvram(_In_reads_bytes_(inLen) const UCHAR *in, _In_ ULONG inLen, _Outptr_ PUCHAR *out, _Out_ PULONG outLen)
+{
+    PUCHAR o = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, inLen + 64, PROBE_TAG);
+    ULONG pos = 0, n = 0, entry, token, words;
+    BOOLEAN boardrev = FALSE;
+
+    *out = NULL; *outLen = 0;
+    if (o == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+
+    while (pos < inLen) {
+        UCHAR ch = in[pos];
+        if (ch == ' ' || ch == '\r' || ch == '\t' || ch == '\n' || ch == 0) { pos++; continue; }
+        if (ch == '#') { while (pos < inLen && in[pos] != '\n') pos++; continue; }
+        if (!IsNvChar(ch)) { pos++; continue; }
+        entry = pos;
+        while (pos < inLen && in[pos] != '=') {
+            if (!IsNvChar(in[pos]) || in[pos] == ' ') break;
+            pos++;
+        }
+        if (pos >= inLen || in[pos] != '=') {                        /* invalid key: skip the line */
+            while (pos < inLen && in[pos] != '\n') pos++;
+            continue;
+        }
+        if (RtlCompareMemory(&in[entry], "RAW1", 4) == 4) {          /* ignored like Linux */
+            while (pos < inLen && in[pos] != '\n') pos++;
+            continue;
+        }
+        if (inLen - entry >= 8 && RtlCompareMemory(&in[entry], "boardrev", 8) == 8) boardrev = TRUE;
+        pos++;                                                       /* skip '=' */
+        while (pos < inLen && IsNvChar(in[pos])) pos++;
+        RtlCopyMemory(&o[n], &in[entry], pos - entry);
+        n += pos - entry;
+        o[n++] = 0;
+    }
+    if (!boardrev) { static const char br[] = "boardrev=0xff"; RtlCopyMemory(&o[n], br, sizeof(br)); n += sizeof(br); }
+    if (n == 0) { ExFreePoolWithTag(o, PROBE_TAG); return STATUS_FILE_INVALID; }
+
+    {   ULONG padded = (n + 1 + 3) & ~3UL;
+        while (n < padded) o[n++] = 0;
+    }
+    words = n / 4;
+    token = (~words << 16) | (words & 0xFFFF);
+    RtlCopyMemory(&o[n], &token, sizeof(token));
+    n += sizeof(token);
+    *out = o; *outLen = n;
+    return STATUS_SUCCESS;
+}
+
+static VOID BootFirmware(_In_ PDEV_CTX c)
+{
+    PUCHAR fw = NULL, nv = NULL, nvraw = NULL;
+    ULONG fwLen = 0, nvLen = 0, nvrawLen = 0;
+    ULONG cr4Base = 0, cr4Wrap = 0, sdBase = 0, sdWrap = 0, d11Base = 0, d11Wrap = 0;
+    ULONG corecap = 0, nab, nbb, idx, bx, blk, ramsize = 0, rambase = RAMBASE_4345, bad = 0, v = 0, rstvec;
+    NTSTATUS st;
+    UCHAR clk = 0, b;
+    ULONG i;
+
+    Put(c, L"Stage", 30);
+    st = ReadFileAll(L"\\??\\C:\\rpiwin\\fw\\brcmfmac43456-sdio.bin", &fw, &fwLen);
+    PutStep(c, L"Fw_Read_St", st, L"Fw_Len", fwLen);
+    if (!NT_SUCCESS(st)) goto out;
+    st = ReadFileAll(L"\\??\\C:\\rpiwin\\fw\\brcmfmac43456-sdio.txt", &nvraw, &nvrawLen);
+    PutStep(c, L"Nv_Read_St", st, L"Nv_RawLen", nvrawLen);
+    if (!NT_SUCCESS(st)) goto out;
+    st = BuildNvram(nvraw, nvrawLen, &nv, &nvLen);
+    PutStep(c, L"Nv_Build_St", st, L"Nv_Len", nvLen);
+    if (!NT_SUCCESS(st)) goto out;
+
+    if (!FindCore(c, CORE_CR4, 0, &cr4Base, &cr4Wrap) || !FindCore(c, CORE_SDIODEV, 0, &sdBase, &sdWrap)) {
+        PutStep(c, L"Cores_St", STATUS_NOT_FOUND, L"Cores_Val", 0);
+        goto out;
+    }
+    (VOID)FindCore(c, CORE_D11, 0, &d11Base, &d11Wrap);
+
+    /* RAM size from the CR4 TCM banks (brcmf_chip_tcm_ramsize) */
+    st = BpRead32(c, cr4Base + 0x04, &corecap);
+    nab = corecap & 0xF; nbb = (corecap & 0xF0) >> 4;
+    for (idx = 0; NT_SUCCESS(st) && idx < nab + nbb; idx++) {
+        st = BpWrite32(c, cr4Base + 0x40, idx);
+        if (!NT_SUCCESS(st)) break;
+        st = BpRead32(c, cr4Base + 0x44, &bx);
+        if (!NT_SUCCESS(st)) break;
+        blk = 8192;
+        if (bx & 0x200) blk >>= 3;
+        ramsize += ((bx & 0x7F) + 1) * blk;
+    }
+    PutStep(c, L"Ram_St", st, L"Ram_Size", ramsize);
+    Put(c, L"Ram_Cap", corecap);
+    Put(c, L"Ram_Base", rambase);
+    if (!NT_SUCCESS(st) || ramsize < 0x10000 || ramsize > 0x400000 || fwLen + nvLen > ramsize) goto out;
+
+    /* set_passive: halt the ARM, disable D11 */
+    Put(c, L"Stage", 31);
+    (VOID)BpRead32(c, cr4Wrap + BCMA_IOCTL, &v);
+    v &= CR4_IOCTL_CPUHALT;
+    CoreReset(c, cr4Wrap, v, CR4_IOCTL_CPUHALT, CR4_IOCTL_CPUHALT);
+    if (d11Wrap != 0) CoreDisable(c, d11Wrap, D11_PHYRESET | D11_PHYCLKEN, D11_PHYCLKEN);
+    (VOID)BpRead32(c, cr4Wrap + BCMA_IOCTL, &v);
+    Put(c, L"Cr4_Ioctl", v);
+
+    /* firmware image at rambase */
+    Put(c, L"Stage", 32);
+    st = RamWrite(c, rambase, fw, fwLen);
+    PutStep(c, L"Fw_Wr_St", st, L"Fw_Wr_Val", fwLen);
+    if (!NT_SUCCESS(st)) goto out;
+    Put(c, L"Stage", 33);
+    st = RamVerify(c, rambase, fw, fwLen, &bad);
+    PutStep(c, L"Fw_Vf_St", st, L"Fw_Vf_Bad", bad);
+    if (!NT_SUCCESS(st) || bad != 0xFFFFFFFF) goto out;
+
+    /* NVRAM at the end of RAM */
+    Put(c, L"Stage", 34);
+    st = RamWrite(c, rambase + ramsize - nvLen, nv, nvLen);
+    PutStep(c, L"Nv_Wr_St", st, L"Nv_Wr_Addr", rambase + ramsize - nvLen);
+    if (!NT_SUCCESS(st)) goto out;
+    st = RamVerify(c, rambase + ramsize - nvLen, nv, nvLen, &bad);
+    PutStep(c, L"Nv_Vf_St", st, L"Nv_Vf_Bad", bad);
+    if (!NT_SUCCESS(st) || bad != 0xFFFFFFFF) goto out;
+
+    /* set_active: clear SDIO core interrupts, write reset vector at 0, release the ARM */
+    Put(c, L"Stage", 35);
+    rstvec = *(PULONG)fw;
+    Put(c, L"Rstvec", rstvec);
+    (VOID)BpWrite32(c, sdBase + 0x20, 0xFFFFFFFF);
+    if (rstvec != 0) {
+        st = RamWrite(c, 0, (const UCHAR *)&rstvec, sizeof(rstvec));
+        PutStep(c, L"Rst_Wr_St", st, L"Rst_Wr_Val", rstvec);
+    }
+    CoreReset(c, cr4Wrap, CR4_IOCTL_CPUHALT, 0, 0);
+    (VOID)BpRead32(c, cr4Wrap + BCMA_IOCTL, &v);
+    Put(c, L"Cr4_Ioctl_After", v);
+
+    /* does the firmware come up? ask for HT clock and wait (it needs the ARM running) */
+    Put(c, L"Stage", 36);
+    st = Cmd52(c, c->Fn, F1_CHIPCLKCSR, TRUE, 0x10 /* HT_AVAIL_REQ */, &b);
+    for (i = 0; i < 2000; i++) {
+        st = Cmd52(c, c->Fn, F1_CHIPCLKCSR, FALSE, 0, &clk);
+        if (NT_SUCCESS(st) && (clk & CLK_HT_AVAIL)) break;
+        {   LARGE_INTEGER t; t.QuadPart = -10 * 1000; KeDelayExecutionThread(KernelMode, FALSE, &t); }
+    }
+    PutStep(c, L"Ht_St", st, L"Ht_Val", clk);
+    Put(c, L"Ht_Ms", i);
+
+    /* firmware publishes its shared-memory pointer in the last RAM word (replacing the NVRAM token) */
+    Put(c, L"Stage", 37);
+    st = BpRead32(c, rambase + ramsize - 4, &v);
+    PutStep(c, L"Shared_St", st, L"Shared_Val", v);
+    Put(c, L"Stage", 39);
+
+out:
+    if (nv != NULL)    ExFreePoolWithTag(nv, PROBE_TAG);
+    if (nvraw != NULL) ExFreePoolWithTag(nvraw, PROBE_TAG);
+    if (fw != NULL)    ExFreePoolWithTag(fw, PROBE_TAG);
 }
 
 
@@ -516,6 +848,14 @@ static VOID RunProbe(_In_ PDEV_CTX Ctx)
             Ctx->WinValid = FALSE;              /* window was programmed outside BpSetWindow */
             ClockInit(Ctx);                     /* M3a: ALP clock like brcmf_sdio_buscoreprep */
             EromScan(Ctx);                      /* M3a: list the SoC cores (read-only)        */
+            {
+                ULONG bootfw = 0;
+                if (GetU32(Ctx, L"BootFw", &bootfw) && bootfw == 1) {
+                    Put(Ctx, L"BootFw", 0);         /* one-shot: never repeats on reboot */
+                    Put(Ctx, L"BootFw_Ran", 1);
+                    BootFirmware(Ctx);
+                }
+            }
         }
     }
 
@@ -553,11 +893,18 @@ static VOID DoProbe(_In_ PDEV_CTX ctx)
         ctx->XferMdl = IoAllocateMdl(ctx->XferBuf, sizeof(ULONG), FALSE, FALSE, NULL);
         if (ctx->XferMdl != NULL) MmBuildMdlForNonPagedPool(ctx->XferMdl);
     }
-    if (ctx->XferBuf != NULL && ctx->XferMdl != NULL) {
+    ctx->Bounce = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, 512, PROBE_TAG);
+    if (ctx->Bounce != NULL) {
+        ctx->BounceMdl = IoAllocateMdl(ctx->Bounce, 512, FALSE, FALSE, NULL);
+        if (ctx->BounceMdl != NULL) MmBuildMdlForNonPagedPool(ctx->BounceMdl);
+    }
+    if (ctx->XferBuf != NULL && ctx->XferMdl != NULL && ctx->Bounce != NULL && ctx->BounceMdl != NULL) {
         RunProbe(ctx);
     } else {
         Put(ctx, L"Probe_Done", 0xFFFFFFFF);
     }
+    if (ctx->BounceMdl != NULL) { IoFreeMdl(ctx->BounceMdl); ctx->BounceMdl = NULL; }
+    if (ctx->Bounce != NULL) { ExFreePoolWithTag(ctx->Bounce, PROBE_TAG); ctx->Bounce = NULL; }
     if (ctx->XferMdl != NULL) { IoFreeMdl(ctx->XferMdl); ctx->XferMdl = NULL; }
     if (ctx->XferBuf != NULL) { ExFreePoolWithTag(ctx->XferBuf, PROBE_TAG); ctx->XferBuf = NULL; }
 
