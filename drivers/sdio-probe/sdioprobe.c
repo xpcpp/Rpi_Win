@@ -17,7 +17,7 @@
 #include <ntstrsafe.h>
 
 #define PROBE_TAG 'bPdS'
-#define PROBE_VERSION 6
+#define PROBE_VERSION 7
 
 typedef struct _DEV_CTX {
     PDEVICE_OBJECT           Self;
@@ -621,6 +621,98 @@ static NTSTATUS BuildNvram(_In_reads_bytes_(inLen) const UCHAR *in, _In_ ULONG i
     return STATUS_SUCCESS;
 }
 
+
+/* ---------- M4a: firmware shared struct + console log (read-only) ---------------- */
+
+static NTSTATUS RamRead(_In_ PDEV_CTX c, _In_ ULONG addr, _Out_writes_bytes_(len) PUCHAR out, _In_ ULONG len)
+{
+    ULONG done = 0;
+    while (done < len) {
+        ULONG a = addr + done, off = a & 0x7FFF, n = 0x8000 - off;
+        NTSTATUS st;
+        if (n > len - done) n = len - done;
+        if (n > RAM_CHUNK) n = RAM_CHUNK;
+        st = BpSetWindow(c, a);
+        if (!NT_SUCCESS(st)) return st;
+        st = Cmd53Bounce(c, c->Fn, off, n, FALSE);
+        if (!NT_SUCCESS(st)) return st;
+        RtlCopyMemory(out + done, c->Bounce, n);
+        done += n;
+    }
+    return STATUS_SUCCESS;
+}
+
+/* store raw firmware text as a REG_SZ (printable ASCII + newlines only) */
+static VOID PutStr(_In_ PDEV_CTX c, _In_ PCWSTR name, _In_reads_bytes_(len) const UCHAR *data, _In_ ULONG len)
+{
+    UNICODE_STRING nm;
+    PWCHAR w;
+    ULONG i, n = 0;
+
+    if (c->Key == NULL) return;
+    w = (PWCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, ((SIZE_T)len + 1) * sizeof(WCHAR), PROBE_TAG);
+    if (w == NULL) return;
+    for (i = 0; i < len; i++) {
+        UCHAR ch = data[i];
+        if (ch == '\n') w[n++] = L'\n';
+        else if (ch >= 0x20 && ch < 0x7f) w[n++] = (WCHAR)ch;
+    }
+    w[n] = 0;
+    RtlInitUnicodeString(&nm, name);
+    (VOID)ZwSetValueKey(c->Key, &nm, 0, REG_SZ, w, (n + 1) * sizeof(WCHAR));
+    (VOID)ZwFlushKey(c->Key);
+    ExFreePoolWithTag(w, PROBE_TAG);
+}
+
+static BOOLEAN InRam(_In_ ULONG a) { return (a >= RAMBASE_4345 && a < RAMBASE_4345 + 0xC8000UL) ? TRUE : FALSE; }
+
+static VOID DumpShared(_In_ PDEV_CTX c)
+{
+    ULONG sh = 0, flags, consoleAddr, bufAddr = 0, bufSize = 0, idx = 0;
+    UCHAR hdr[64];
+    PUCHAR buf = NULL, ordered = NULL;
+    NTSTATUS st;
+
+    Put(c, L"Stage", 40);
+    st = BpRead32(c, RAMBASE_4345 + 0xC8000UL - 4, &sh);
+    PutStep(c, L"Sh_Ptr_St", st, L"Sh_Addr", sh);
+    if (!NT_SUCCESS(st) || sh == 0 || !InRam(sh) || ((~sh >> 16) & 0xFFFF) == (sh >> 16)) { Put(c, L"Sh_Valid", 0); return; }
+
+    st = RamRead(c, sh, hdr, sizeof(hdr));
+    PutStep(c, L"Sh_Rd_St", st, L"Sh_Valid", NT_SUCCESS(st) ? 1 : 0);
+    if (!NT_SUCCESS(st)) return;
+
+    flags = *(PULONG)&hdr[0];
+    consoleAddr = *(PULONG)&hdr[20];
+    Put(c, L"Sh_Flags", flags);                       /* low byte = shared version, 0x100 assert built, 0x200 assert, 0x400 trap */
+    Put(c, L"Sh_Trap", *(PULONG)&hdr[4]);
+    Put(c, L"Sh_AssertLine", *(PULONG)&hdr[16]);
+    Put(c, L"Sh_Console", consoleAddr);
+    PutStr(c, L"Sh_Tag", &hdr[28], 32);
+
+    if (!InRam(consoleAddr)) return;
+    st = RamRead(c, consoleAddr + 8, hdr, 12);          /* rte_console.log_le: buf, buf_size, idx */
+    if (!NT_SUCCESS(st)) { Put(c, L"Con_St", (ULONG)st); return; }
+    bufAddr = *(PULONG)&hdr[0]; bufSize = *(PULONG)&hdr[4]; idx = *(PULONG)&hdr[8];
+    Put(c, L"Con_Buf", bufAddr); Put(c, L"Con_Size", bufSize); Put(c, L"Con_Idx", idx);
+    if (bufSize == 0 || bufSize > 0x4000 || idx > bufSize || !InRam(bufAddr)) return;
+
+    buf = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, (SIZE_T)bufSize * 2, PROBE_TAG);
+    if (buf == NULL) return;
+    ordered = buf + bufSize;
+    st = RamRead(c, bufAddr, buf, bufSize);
+    Put(c, L"Con_Rd_St", (ULONG)st);
+    if (NT_SUCCESS(st)) {
+        ULONG n = 0, i;
+        if (idx < bufSize && buf[idx] != 0) {              /* ring has wrapped: oldest data starts at idx */
+            for (i = idx; i < bufSize; i++) ordered[n++] = buf[i];
+        }
+        for (i = 0; i < idx; i++) ordered[n++] = buf[i];
+        PutStr(c, L"Console", ordered, n);
+    }
+    ExFreePoolWithTag(buf, PROBE_TAG);
+}
+
 static VOID BootFirmware(_In_ PDEV_CTX c)
 {
     PUCHAR fw = NULL, nv = NULL, nvraw = NULL;
@@ -721,6 +813,8 @@ static VOID BootFirmware(_In_ PDEV_CTX c)
     Put(c, L"Stage", 37);
     st = BpRead32(c, rambase + ramsize - 4, &v);
     PutStep(c, L"Shared_St", st, L"Shared_Val", v);
+    {   LARGE_INTEGER t; t.QuadPart = -10 * 1000 * 500; KeDelayExecutionThread(KernelMode, FALSE, &t); }   /* 500 ms for fw init */
+    DumpShared(c);
     Put(c, L"Stage", 39);
 
 out:
@@ -854,6 +948,10 @@ static VOID RunProbe(_In_ PDEV_CTX Ctx)
                     Put(Ctx, L"BootFw", 0);         /* one-shot: never repeats on reboot */
                     Put(Ctx, L"BootFw_Ran", 1);
                     BootFirmware(Ctx);
+                }
+                if (GetU32(Ctx, L"ReadConsole", &bootfw) && bootfw == 1) {
+                    Put(Ctx, L"ReadConsole", 0);
+                    DumpShared(Ctx);
                 }
             }
         }
