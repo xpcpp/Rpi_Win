@@ -17,7 +17,7 @@
 #include <ntstrsafe.h>
 
 #define PROBE_TAG 'bPdS'
-#define PROBE_VERSION 7
+#define PROBE_VERSION 8
 
 typedef struct _DEV_CTX {
     PDEVICE_OBJECT           Self;
@@ -31,6 +31,7 @@ typedef struct _DEV_CTX {
     UCHAR                    Fn;
     BOOLEAN                  BlockOk;
     BOOLEAN                  WinValid;
+    ULONG                    TxSeq;
     ULONG                    CurWin;
     PUCHAR                   Bounce;       /* 512-byte non-paged bounce buffer for CMD53 bulk transfers */
     PMDL                     BounceMdl;
@@ -824,6 +825,149 @@ out:
 }
 
 
+
+/* ---------- M4b: enable F2, SDPCM/BCDC "ver" ioctl, polling (no interrupts) ------- */
+
+#define SD_INTSTATUS        0x20
+#define SD_HOSTINTMASK      0x24
+#define SD_TOSBMAILBOXDATA  0x48
+#define I_HMB_FRAME_IND     0x40
+#define I_CHIPACTIVE        0x20000000UL
+#define HOSTINTMASK_VAL     (0xF0UL | I_CHIPACTIVE)
+#define F1_WATERMARK        0x10008
+#define F1_SLEEPCSR         0x1001F
+#define BRCMF_C_GET_VAR     262
+
+static VOID PutHex(_In_ PDEV_CTX c, _In_ PCWSTR name, _In_reads_bytes_(len) const UCHAR *data, _In_ ULONG len)
+{
+    static const char hexd[] = "0123456789abcdef";
+    UCHAR txt[1100];
+    ULONG i, n = 0;
+    if (len > 256) len = 256;
+    for (i = 0; i < len; i++) {
+        txt[n++] = (UCHAR)hexd[data[i] >> 4];
+        txt[n++] = (UCHAR)hexd[data[i] & 0xF];
+        if ((i & 15) == 15) txt[n++] = '\n'; else if ((i & 3) == 3) txt[n++] = ' ';
+    }
+    PutStr(c, name, txt, n);
+}
+
+static NTSTATUS F2Write(_In_ PDEV_CTX c, _In_reads_bytes_(len) const UCHAR *data, _In_ ULONG len)
+{
+    NTSTATUS st = BpSetWindow(c, SI_ENUM_BASE);              /* F2 FIFO lives at chipcommon base, 4-byte access flag */
+    if (!NT_SUCCESS(st)) return st;
+    RtlCopyMemory(c->Bounce, data, len);
+    return Cmd53Bounce(c, 2, (SI_ENUM_BASE & 0x7FFF) | 0x8000, len, TRUE);
+}
+
+static NTSTATUS F2Read(_In_ PDEV_CTX c, _Out_writes_bytes_(len) PUCHAR out, _In_ ULONG len)
+{
+    NTSTATUS st = BpSetWindow(c, SI_ENUM_BASE);
+    if (!NT_SUCCESS(st)) return st;
+    st = Cmd53Bounce(c, 2, (SI_ENUM_BASE & 0x7FFF) | 0x8000, len, FALSE);
+    if (NT_SUCCESS(st)) RtlCopyMemory(out, c->Bounce, len);
+    return st;
+}
+
+static VOID Ioctl4b(_In_ PDEV_CTX c)
+{
+    NTSTATUS st;
+    UCHAR b = 0, rdy = 0;
+    ULONG sdBase = 0, sdWrap = 0, v = 0, i;
+    UCHAR frame[160], rx[512];
+    ULONG datalen = 128, total, tag = 0x1234, others = 0;
+    BOOLEAN got = FALSE;
+
+    Put(c, L"Stage", 50);
+    if (!FindCore(c, CORE_SDIODEV, 0, &sdBase, &sdWrap)) { Put(c, L"F2_Cores", 0); return; }
+
+    /* keep-SDIO-on, protocol version mailbox, enable F2, host interrupt mask, watermark (default chip case) */
+    (VOID)Cmd52(c, c->Fn, F1_SLEEPCSR, TRUE, 0x01, &b);
+    st = BpWrite32(c, sdBase + SD_TOSBMAILBOXDATA, 4UL << 16);
+    PutStep(c, L"F2_Mbx_St", st, L"F2_Mbx_Val", 4UL << 16);
+
+    st = Cmd52(c, 0, 0x02, FALSE, 0, &b);
+    if (NT_SUCCESS(st)) st = Cmd52(c, 0, 0x02, TRUE, (UCHAR)(b | 0x04), &b);
+    PutStep(c, L"F2_En_St", st, L"F2_En_Val", b);
+    for (i = 0; i < 100; i++) {
+        NTSTATUS s2 = Cmd52(c, 0, 0x03, FALSE, 0, &rdy);
+        if (NT_SUCCESS(s2) && (rdy & 0x04)) break;
+        Delay100ms();
+    }
+    PutStep(c, L"F2_Rdy_St", STATUS_SUCCESS, L"F2_Rdy_Val", rdy);
+    if (!(rdy & 0x04)) return;
+
+    /* F2 block size 512 through the FBR (function 0 space, 0x210/0x211) */
+    (VOID)Cmd52(c, 0, 0x210, TRUE, 0x00, &b);
+    (VOID)Cmd52(c, 0, 0x211, TRUE, 0x02, &b);
+
+    st = BpWrite32(c, sdBase + SD_HOSTINTMASK, HOSTINTMASK_VAL);
+    PutStep(c, L"F2_Mask_St", st, L"F2_Mask_Val", HOSTINTMASK_VAL);
+    st = Cmd52(c, c->Fn, F1_WATERMARK, TRUE, 0x08, &b);
+    PutStep(c, L"F2_Wm_St", st, L"F2_Wm_Val", 0x08);
+
+    st = BpRead32(c, sdBase + SD_INTSTATUS, &v);
+    PutStep(c, L"Int0_St", st, L"Int0_Val", v);
+
+    /* build the "ver" GET_VAR control frame: SDPCM hw hdr(4) + sw hdr(8) + BCDC dcmd(16) + data */
+    Put(c, L"Stage", 51);
+    total = 12 + 16 + datalen;
+    RtlZeroMemory(frame, sizeof(frame));
+    *(PUSHORT)&frame[0] = (USHORT)total;
+    *(PUSHORT)&frame[2] = (USHORT)~total;
+    *(PULONG)&frame[4]  = (c->TxSeq & 0xFF) | (0UL << 8) | (12UL << 24);       /* seq | channel 0 (control) | data offset */
+    *(PULONG)&frame[8]  = 0;
+    *(PULONG)&frame[12] = BRCMF_C_GET_VAR;
+    *(PULONG)&frame[16] = datalen;
+    *(PULONG)&frame[20] = (tag << 16) | 0;                                      /* id << 16 | if 0 | GET */
+    *(PULONG)&frame[24] = 0;
+    RtlCopyMemory(&frame[28], "ver", 4);
+    st = F2Write(c, frame, total);
+    PutStep(c, L"F2Tx_St", st, L"F2Tx_Len", total);
+    if (!NT_SUCCESS(st)) return;
+    c->TxSeq = (c->TxSeq + 1) & 0xFF;
+
+    /* poll for the reply frame */
+    Put(c, L"Stage", 52);
+    for (i = 0; i < 3000 && !got; i++) {
+        st = BpRead32(c, sdBase + SD_INTSTATUS, &v);
+        if (NT_SUCCESS(st) && (v & I_HMB_FRAME_IND)) {
+            ULONG len, cs, sw, chan, off;
+            (VOID)BpWrite32(c, sdBase + SD_INTSTATUS, v & I_HMB_FRAME_IND);       /* write-1-to-clear */
+            Put(c, L"Int1_Val", v);
+            st = F2Read(c, rx, 64);
+            PutStep(c, L"F2Rx_St", st, L"F2Rx_Probes", others);
+            if (!NT_SUCCESS(st)) { Put(c, L"Stage", 58); return; }
+            len = *(PUSHORT)&rx[0]; cs = *(PUSHORT)&rx[2];
+            sw = *(PULONG)&rx[4];
+            chan = (sw >> 8) & 0xF; off = sw >> 24;
+            Put(c, L"Rx_Len", len); Put(c, L"Rx_Chan", chan); Put(c, L"Rx_Off", off); Put(c, L"Rx_Cs", cs);
+            if (((len ^ cs) & 0xFFFF) != 0xFFFF || len < 12 || len > 512) { PutHex(c, L"Rx_Hex", rx, 64); Put(c, L"Stage", 57); return; }
+            if (len > 64) {
+                ULONG rest = len - 64;
+                st = F2Read(c, rx + 64, (rest + 3) & ~3UL);
+                PutStep(c, L"F2Rx2_St", st, L"F2Rx2_Len", rest);
+                if (!NT_SUCCESS(st)) return;
+            }
+            if (chan == 0 && off >= 12 && off + 16 <= len) {
+                ULONG status = *(PULONG)&rx[off + 12];
+                Put(c, L"Rx_Cmd", *(PULONG)&rx[off]); Put(c, L"Rx_Flags", *(PULONG)&rx[off + 8]); Put(c, L"Rx_Status", status);
+                PutStr(c, L"Ioctl_Ver", &rx[off + 16], len - off - 16);
+                PutHex(c, L"Rx_Hex", rx, len < 96 ? len : 96);
+                got = TRUE;
+            } else {
+                others++;                                                          /* event/data frame: ignore */
+                Put(c, L"Rx_Other", others);
+                PutHex(c, L"Rx_Other_Hex", rx, 48);
+            }
+        } else {
+            LARGE_INTEGER t; t.QuadPart = -10 * 1000; KeDelayExecutionThread(KernelMode, FALSE, &t);
+        }
+    }
+    Put(c, L"Ioctl_Got", got ? 1 : 0);
+    Put(c, L"Stage", got ? 59 : 56);
+}
+
 static VOID RunProbe(_In_ PDEV_CTX Ctx)
 {
     NTSTATUS st;
@@ -952,6 +1096,10 @@ static VOID RunProbe(_In_ PDEV_CTX Ctx)
                 if (GetU32(Ctx, L"ReadConsole", &bootfw) && bootfw == 1) {
                     Put(Ctx, L"ReadConsole", 0);
                     DumpShared(Ctx);
+                }
+                if (GetU32(Ctx, L"Ioctl", &bootfw) && bootfw == 1) {
+                    Put(Ctx, L"Ioctl", 0);              /* one-shot */
+                    Ioctl4b(Ctx);
                 }
             }
         }
