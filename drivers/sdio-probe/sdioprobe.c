@@ -17,7 +17,7 @@
 #include <ntstrsafe.h>
 
 #define PROBE_TAG 'bPdS'
-#define PROBE_VERSION 9
+#define PROBE_VERSION 10
 
 typedef struct _DEV_CTX {
     PDEVICE_OBJECT           Self;
@@ -32,6 +32,8 @@ typedef struct _DEV_CTX {
     BOOLEAN                  BlockOk;
     BOOLEAN                  WinValid;
     ULONG                    TxSeq;
+    ULONG                    FrCount;
+    ULONG                    MbCount;
     ULONG                    CurWin;
     PUCHAR                   Bounce;       /* 512-byte non-paged bounce buffer for CMD53 bulk transfers */
     PMDL                     BounceMdl;
@@ -892,12 +894,16 @@ static VOID ServiceInts(_In_ PDEV_CTX c, _In_ ULONG sdBase, _Inout_ PBOOLEAN got
         (VOID)BpWrite32(c, sdBase + SD_TOSBMAILBOX, SMB_INT_ACK);     /* ack */
         Put(c, L"Mbx_Data", mb);
         Put(c, L"Mbx_Seen", 1);
+        if (c->MbCount < 6) { WCHAR n[16]; if (NT_SUCCESS(RtlStringCchPrintfW(n, 16, L"Mb%u", c->MbCount))) Put(c, n, mb); }
+        c->MbCount++;
     }
     if (v & I_HMB_FRAME_IND) {
         ULONG len, cs, sw, chan, off;
         st = F2Read(c, rx, 64);
         if (!NT_SUCCESS(st)) { Put(c, L"F2Rx_Err", (ULONG)st); return; }
         (*nFrames)++;
+        if (c->FrCount < 6) { WCHAR n[16]; if (NT_SUCCESS(RtlStringCchPrintfW(n, 16, L"Fr%u_Hex", c->FrCount))) PutHex(c, n, rx, 32); }
+        c->FrCount++;
         len = *(PUSHORT)&rx[0]; cs = *(PUSHORT)&rx[2];
         sw = *(PULONG)&rx[4];
         chan = (sw >> 8) & 0xF; off = sw >> 24;
@@ -923,16 +929,48 @@ static VOID ServiceInts(_In_ PDEV_CTX c, _In_ ULONG sdBase, _Inout_ PBOOLEAN got
     }
 }
 
+/* Build + send one "ver" GET_VAR control frame. Variants (to find what the firmware accepts):
+ *   0: hw len = 156 (unpadded), send 160     (Linux: hd_info.len = len - pad)
+ *   1: hw len = 160 (padded),   send 160
+ *   2: hw len = 156,            send 156 (no pad)
+ *   3: like 0 but CCCR interrupt-enable (IEN) bits set first
+ *   4: like 0 with a 64-byte output buffer
+ */
+static NTSTATUS SendVer(_In_ PDEV_CTX c, _In_ ULONG variant)
+{
+    UCHAR frame[192], b = 0;
+    ULONG datalen = (variant == 4) ? 64 : 128;
+    ULONG total = 12 + 16 + datalen;
+    ULONG sendlen = (total + 7) & ~7UL;
+    ULONG hwlen = total;
+
+    if (variant == 1) hwlen = sendlen;
+    if (variant == 2) sendlen = total;
+    if (variant == 3) (VOID)Cmd52(c, 0, 0x04, TRUE, 0x07, &b);          /* IEN: master + F1 + F2 */
+
+    RtlZeroMemory(frame, sizeof(frame));
+    *(PUSHORT)&frame[0] = (USHORT)hwlen;
+    *(PUSHORT)&frame[2] = (USHORT)~hwlen;
+    *(PULONG)&frame[4]  = (c->TxSeq & 0xFF) | (0UL << 8) | (12UL << 24);
+    *(PULONG)&frame[8]  = 0;
+    *(PULONG)&frame[12] = BRCMF_C_GET_VAR;
+    *(PULONG)&frame[16] = datalen;
+    *(PULONG)&frame[20] = (0x1234UL + variant) << 16;
+    *(PULONG)&frame[24] = 0;
+    RtlCopyMemory(&frame[28], "ver", 4);
+    c->TxSeq = (c->TxSeq + 1) & 0xFF;
+    return F2Write(c, frame, sendlen);
+}
+
 static VOID Ioctl4b(_In_ PDEV_CTX c)
 {
     NTSTATUS st;
     UCHAR b = 0, rdy = 0;
-    ULONG sdBase = 0, sdWrap = 0, v = 0, i;
-    UCHAR frame[192];
-    ULONG datalen = 128, total, sendlen, tag = 0x1234, nIntr = 0, nFrames = 0;
+    ULONG sdBase = 0, sdWrap = 0, v = 0, i, variant, nIntr = 0, nFrames = 0, ms;
     BOOLEAN got = FALSE;
 
     Put(c, L"Stage", 50);
+    c->FrCount = 0; c->MbCount = 0;
     if (!FindCore(c, CORE_SDIODEV, 0, &sdBase, &sdWrap)) { Put(c, L"F2_Cores", 0); return; }
 
     (VOID)Cmd52(c, c->Fn, F1_SLEEPCSR, TRUE, 0x01, &b);               /* KSO */
@@ -957,45 +995,33 @@ static VOID Ioctl4b(_In_ PDEV_CTX c)
     st = Cmd52(c, c->Fn, F1_WATERMARK, TRUE, 0x08, &b);
     PutStep(c, L"F2_Wm_St", st, L"F2_Wm_Val", 0x08);
 
-    /* 1) service whatever the firmware already posted (mailbox + credit frame) */
-    Put(c, L"Stage", 51);
+    Put(c, L"Stage", 51);                                              /* service what the firmware already posted */
     for (i = 0; i < 300; i++) {
         ServiceInts(c, sdBase, &got, &nIntr, &nFrames);
         { LARGE_INTEGER t; t.QuadPart = -10 * 1000; KeDelayExecutionThread(KernelMode, FALSE, &t); }
     }
     Put(c, L"Pre_Intr", nIntr); Put(c, L"Pre_Frames", nFrames);
 
-    /* 2) "ver" GET_VAR as a control frame, padded to 8 bytes like Linux on a 64-bit host */
-    Put(c, L"Stage", 52);
-    total = 12 + 16 + datalen;
-    sendlen = (total + 7) & ~7UL;
-    RtlZeroMemory(frame, sizeof(frame));
-    *(PUSHORT)&frame[0] = (USHORT)total;
-    *(PUSHORT)&frame[2] = (USHORT)~total;
-    *(PULONG)&frame[4]  = (c->TxSeq & 0xFF) | (0UL << 8) | (12UL << 24);
-    *(PULONG)&frame[8]  = 0;
-    *(PULONG)&frame[12] = BRCMF_C_GET_VAR;
-    *(PULONG)&frame[16] = datalen;
-    *(PULONG)&frame[20] = (tag << 16) | 0;
-    *(PULONG)&frame[24] = 0;
-    RtlCopyMemory(&frame[28], "ver", 4);
-    st = F2Write(c, frame, sendlen);
-    PutStep(c, L"F2Tx_St", st, L"F2Tx_Len", sendlen);
-    if (!NT_SUCCESS(st)) return;
-    c->TxSeq = (c->TxSeq + 1) & 0xFF;
-
-    /* 3) poll + service for up to 3 s */
-    Put(c, L"Stage", 53);
-    for (i = 0; i < 3000 && !got; i++) {
-        ServiceInts(c, sdBase, &got, &nIntr, &nFrames);
-        { LARGE_INTEGER t; t.QuadPart = -10 * 1000; KeDelayExecutionThread(KernelMode, FALSE, &t); }
+    for (variant = 0; variant < 5 && !got; variant++) {
+        ULONG f0 = nFrames, i0 = nIntr;
+        WCHAR n[24];
+        Put(c, L"Stage", 52 + variant);
+        st = SendVer(c, variant);
+        if (NT_SUCCESS(RtlStringCchPrintfW(n, 24, L"V%u_Tx_St", variant))) Put(c, n, (ULONG)st);
+        if (!NT_SUCCESS(st)) break;
+        for (ms = 0; ms < 900 && !got; ms++) {
+            ServiceInts(c, sdBase, &got, &nIntr, &nFrames);
+            { LARGE_INTEGER t; t.QuadPart = -10 * 1000; KeDelayExecutionThread(KernelMode, FALSE, &t); }
+        }
+        if (NT_SUCCESS(RtlStringCchPrintfW(n, 24, L"V%u_Frames", variant))) Put(c, n, nFrames - f0);
+        if (NT_SUCCESS(RtlStringCchPrintfW(n, 24, L"V%u_Intr", variant)))   Put(c, n, nIntr - i0);
+        if (got) Put(c, L"Ioctl_Variant", variant);
     }
     Put(c, L"Intr_Total", nIntr); Put(c, L"Frames_Total", nFrames);
     Put(c, L"Ioctl_Got", got ? 1 : 0);
     st = BpRead32(c, sdBase + SD_INTSTATUS, &v);
     Put(c, L"Int_End", v);
 
-    /* 4) what does the firmware say about it? */
     { LARGE_INTEGER t; t.QuadPart = -10 * 1000 * 300; KeDelayExecutionThread(KernelMode, FALSE, &t); }
     DumpShared(c);
     Put(c, L"Stage", got ? 59 : 56);
@@ -1117,7 +1143,12 @@ static VOID RunProbe(_In_ PDEV_CTX Ctx)
         PutStep(Ctx, L"Sig_St", st, L"Sig_Val", v32);
         if (NT_SUCCESS(st) && v32 != 0 && v32 != 0xFFFFFFFF) {
             Ctx->WinValid = FALSE;              /* window was programmed outside BpSetWindow */
-            ClockInit(Ctx);                     /* M3a: ALP clock like brcmf_sdio_buscoreprep */
+            {
+                UCHAR clk0 = 0;
+                (VOID)Cmd52(Ctx, fn, F1_CHIPCLKCSR, FALSE, 0, &clk0);
+                Put(Ctx, L"Clk_At_Start", clk0);
+                if (!(clk0 & CLK_HT_AVAIL)) ClockInit(Ctx);     /* M3a: only on a cold chip; never touch clocks of a running firmware */
+            }
             EromScan(Ctx);                      /* M3a: list the SoC cores (read-only)        */
             {
                 ULONG bootfw = 0;
