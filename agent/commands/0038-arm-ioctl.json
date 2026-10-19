@@ -1,0 +1,5 @@
+{
+ "action": "ps",
+ "timeout_sec": 300,
+ "script": "$d = $null\nfor ($t = 0; $t -lt 36; $t++) {\n  $d = Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like 'SD\\VID_02D0&PID_A9A6&FN_1*' } | Select-Object -First 1\n  if ($d -and $d.Status -eq 'OK') { break }\n  Start-Sleep -Seconds 5\n}\nif (-not $d) { 'FN_1 device not present after 3 min'; return }\nStart-Sleep -Seconds 10    # let the boot-time probe (M3a) finish\n$root = 'HKLM:\\SYSTEM\\CurrentControlSet\\Enum\\SD\\VID_02D0&PID_A9A6&FN_1'\nforeach ($i in Get-ChildItem $root) {\n  $k = Join-Path $i.PSPath 'Device Parameters'\n  if (-not (Test-Path $k)) { New-Item $k -Force | Out-Null }\n  Set-ItemProperty $k -Name BootFw -Value 1 -Type DWord\n  Set-ItemProperty $k -Name Ioctl -Value 1 -Type DWord\n  Set-ItemProperty $k -Name ProbeState -Value 0 -Type DWord\n  \"armed BootFw+Ioctl: $($i.PSChildName)  Ver=\" + (Get-ItemProperty $k).Ver\n}\npnputil /restart-device $d.InstanceId | Out-String"
+}
