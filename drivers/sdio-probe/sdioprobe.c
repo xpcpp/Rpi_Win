@@ -17,7 +17,7 @@
 #include <ntstrsafe.h>
 
 #define PROBE_TAG 'bPdS'
-#define PROBE_VERSION 8
+#define PROBE_VERSION 9
 
 typedef struct _DEV_CTX {
     PDEVICE_OBJECT           Self;
@@ -869,21 +869,74 @@ static NTSTATUS F2Read(_In_ PDEV_CTX c, _Out_writes_bytes_(len) PUCHAR out, _In_
     return st;
 }
 
+#define SD_TOSBMAILBOX      0x40
+#define SD_TOHOSTMAILBOXDATA 0x4C
+#define SMB_INT_ACK         0x2
+#define I_HMB_HOST_INT      0x80
+
+/* Port of the essential parts of brcmf_sdio_dpc(): clear intstatus, ack the mailbox, read frames. */
+static VOID ServiceInts(_In_ PDEV_CTX c, _In_ ULONG sdBase, _Inout_ PBOOLEAN got, _Inout_ PULONG nIntr, _Inout_ PULONG nFrames)
+{
+    ULONG v = 0, clear, mb = 0;
+    UCHAR rx[512];
+    NTSTATUS st = BpRead32(c, sdBase + SD_INTSTATUS, &v);
+    if (!NT_SUCCESS(st)) return;
+    clear = v & HOSTINTMASK_VAL;
+    if (clear == 0) return;
+    (*nIntr)++;
+    if (*nIntr <= 4) { WCHAR n[16]; if (NT_SUCCESS(RtlStringCchPrintfW(n, 16, L"Int_%u", *nIntr))) Put(c, n, v); }
+    (VOID)BpWrite32(c, sdBase + SD_INTSTATUS, clear);                 /* write-1-to-clear */
+
+    if (v & I_HMB_HOST_INT) {                                         /* mailbox from the firmware */
+        st = BpRead32(c, sdBase + SD_TOHOSTMAILBOXDATA, &mb);
+        (VOID)BpWrite32(c, sdBase + SD_TOSBMAILBOX, SMB_INT_ACK);     /* ack */
+        Put(c, L"Mbx_Data", mb);
+        Put(c, L"Mbx_Seen", 1);
+    }
+    if (v & I_HMB_FRAME_IND) {
+        ULONG len, cs, sw, chan, off;
+        st = F2Read(c, rx, 64);
+        if (!NT_SUCCESS(st)) { Put(c, L"F2Rx_Err", (ULONG)st); return; }
+        (*nFrames)++;
+        len = *(PUSHORT)&rx[0]; cs = *(PUSHORT)&rx[2];
+        sw = *(PULONG)&rx[4];
+        chan = (sw >> 8) & 0xF; off = sw >> 24;
+        if (((len ^ cs) & 0xFFFF) != 0xFFFF || len < 12 || len > 512) { PutHex(c, L"Rx_BadHex", rx, 64); return; }
+        if (len > 64) {
+            st = F2Read(c, rx + 64, (len - 64 + 3) & ~3UL);
+            if (!NT_SUCCESS(st)) { Put(c, L"F2Rx2_Err", (ULONG)st); return; }
+        }
+        if (len == 12) {                                              /* header-only: flow control / credits */
+            Put(c, L"Fc_MaxSeq", (*(PULONG)&rx[8] >> 8) & 0xFF);
+            return;
+        }
+        Put(c, L"Rx_Len", len); Put(c, L"Rx_Chan", chan); Put(c, L"Rx_Off", off);
+        if (chan == 0 && off >= 12 && off + 16 <= len) {
+            Put(c, L"Rx_Cmd", *(PULONG)&rx[off]); Put(c, L"Rx_Flags", *(PULONG)&rx[off + 8]); Put(c, L"Rx_Status", *(PULONG)&rx[off + 12]);
+            PutStr(c, L"Ioctl_Ver", &rx[off + 16], len - off - 16);
+            PutHex(c, L"Rx_Hex", rx, len < 96 ? len : 96);
+            *got = TRUE;
+        } else {
+            Put(c, L"Rx_Other", *nFrames);
+            PutHex(c, L"Rx_Other_Hex", rx, 48);
+        }
+    }
+}
+
 static VOID Ioctl4b(_In_ PDEV_CTX c)
 {
     NTSTATUS st;
     UCHAR b = 0, rdy = 0;
     ULONG sdBase = 0, sdWrap = 0, v = 0, i;
-    UCHAR frame[160], rx[512];
-    ULONG datalen = 128, total, tag = 0x1234, others = 0;
+    UCHAR frame[192];
+    ULONG datalen = 128, total, sendlen, tag = 0x1234, nIntr = 0, nFrames = 0;
     BOOLEAN got = FALSE;
 
     Put(c, L"Stage", 50);
     if (!FindCore(c, CORE_SDIODEV, 0, &sdBase, &sdWrap)) { Put(c, L"F2_Cores", 0); return; }
 
-    /* keep-SDIO-on, protocol version mailbox, enable F2, host interrupt mask, watermark (default chip case) */
-    (VOID)Cmd52(c, c->Fn, F1_SLEEPCSR, TRUE, 0x01, &b);
-    st = BpWrite32(c, sdBase + SD_TOSBMAILBOXDATA, 4UL << 16);
+    (VOID)Cmd52(c, c->Fn, F1_SLEEPCSR, TRUE, 0x01, &b);               /* KSO */
+    st = BpWrite32(c, sdBase + SD_TOSBMAILBOXDATA, 4UL << 16);       /* host protocol version 4 */
     PutStep(c, L"F2_Mbx_St", st, L"F2_Mbx_Val", 4UL << 16);
 
     st = Cmd52(c, 0, 0x02, FALSE, 0, &b);
@@ -897,74 +950,54 @@ static VOID Ioctl4b(_In_ PDEV_CTX c)
     PutStep(c, L"F2_Rdy_St", STATUS_SUCCESS, L"F2_Rdy_Val", rdy);
     if (!(rdy & 0x04)) return;
 
-    /* F2 block size 512 through the FBR (function 0 space, 0x210/0x211) */
-    (VOID)Cmd52(c, 0, 0x210, TRUE, 0x00, &b);
+    (VOID)Cmd52(c, 0, 0x210, TRUE, 0x00, &b);                         /* F2 block size 512 */
     (VOID)Cmd52(c, 0, 0x211, TRUE, 0x02, &b);
-
     st = BpWrite32(c, sdBase + SD_HOSTINTMASK, HOSTINTMASK_VAL);
     PutStep(c, L"F2_Mask_St", st, L"F2_Mask_Val", HOSTINTMASK_VAL);
     st = Cmd52(c, c->Fn, F1_WATERMARK, TRUE, 0x08, &b);
     PutStep(c, L"F2_Wm_St", st, L"F2_Wm_Val", 0x08);
 
-    st = BpRead32(c, sdBase + SD_INTSTATUS, &v);
-    PutStep(c, L"Int0_St", st, L"Int0_Val", v);
-
-    /* build the "ver" GET_VAR control frame: SDPCM hw hdr(4) + sw hdr(8) + BCDC dcmd(16) + data */
+    /* 1) service whatever the firmware already posted (mailbox + credit frame) */
     Put(c, L"Stage", 51);
+    for (i = 0; i < 300; i++) {
+        ServiceInts(c, sdBase, &got, &nIntr, &nFrames);
+        { LARGE_INTEGER t; t.QuadPart = -10 * 1000; KeDelayExecutionThread(KernelMode, FALSE, &t); }
+    }
+    Put(c, L"Pre_Intr", nIntr); Put(c, L"Pre_Frames", nFrames);
+
+    /* 2) "ver" GET_VAR as a control frame, padded to 8 bytes like Linux on a 64-bit host */
+    Put(c, L"Stage", 52);
     total = 12 + 16 + datalen;
+    sendlen = (total + 7) & ~7UL;
     RtlZeroMemory(frame, sizeof(frame));
     *(PUSHORT)&frame[0] = (USHORT)total;
     *(PUSHORT)&frame[2] = (USHORT)~total;
-    *(PULONG)&frame[4]  = (c->TxSeq & 0xFF) | (0UL << 8) | (12UL << 24);       /* seq | channel 0 (control) | data offset */
+    *(PULONG)&frame[4]  = (c->TxSeq & 0xFF) | (0UL << 8) | (12UL << 24);
     *(PULONG)&frame[8]  = 0;
     *(PULONG)&frame[12] = BRCMF_C_GET_VAR;
     *(PULONG)&frame[16] = datalen;
-    *(PULONG)&frame[20] = (tag << 16) | 0;                                      /* id << 16 | if 0 | GET */
+    *(PULONG)&frame[20] = (tag << 16) | 0;
     *(PULONG)&frame[24] = 0;
     RtlCopyMemory(&frame[28], "ver", 4);
-    st = F2Write(c, frame, total);
-    PutStep(c, L"F2Tx_St", st, L"F2Tx_Len", total);
+    st = F2Write(c, frame, sendlen);
+    PutStep(c, L"F2Tx_St", st, L"F2Tx_Len", sendlen);
     if (!NT_SUCCESS(st)) return;
     c->TxSeq = (c->TxSeq + 1) & 0xFF;
 
-    /* poll for the reply frame */
-    Put(c, L"Stage", 52);
+    /* 3) poll + service for up to 3 s */
+    Put(c, L"Stage", 53);
     for (i = 0; i < 3000 && !got; i++) {
-        st = BpRead32(c, sdBase + SD_INTSTATUS, &v);
-        if (NT_SUCCESS(st) && (v & I_HMB_FRAME_IND)) {
-            ULONG len, cs, sw, chan, off;
-            (VOID)BpWrite32(c, sdBase + SD_INTSTATUS, v & I_HMB_FRAME_IND);       /* write-1-to-clear */
-            Put(c, L"Int1_Val", v);
-            st = F2Read(c, rx, 64);
-            PutStep(c, L"F2Rx_St", st, L"F2Rx_Probes", others);
-            if (!NT_SUCCESS(st)) { Put(c, L"Stage", 58); return; }
-            len = *(PUSHORT)&rx[0]; cs = *(PUSHORT)&rx[2];
-            sw = *(PULONG)&rx[4];
-            chan = (sw >> 8) & 0xF; off = sw >> 24;
-            Put(c, L"Rx_Len", len); Put(c, L"Rx_Chan", chan); Put(c, L"Rx_Off", off); Put(c, L"Rx_Cs", cs);
-            if (((len ^ cs) & 0xFFFF) != 0xFFFF || len < 12 || len > 512) { PutHex(c, L"Rx_Hex", rx, 64); Put(c, L"Stage", 57); return; }
-            if (len > 64) {
-                ULONG rest = len - 64;
-                st = F2Read(c, rx + 64, (rest + 3) & ~3UL);
-                PutStep(c, L"F2Rx2_St", st, L"F2Rx2_Len", rest);
-                if (!NT_SUCCESS(st)) return;
-            }
-            if (chan == 0 && off >= 12 && off + 16 <= len) {
-                ULONG status = *(PULONG)&rx[off + 12];
-                Put(c, L"Rx_Cmd", *(PULONG)&rx[off]); Put(c, L"Rx_Flags", *(PULONG)&rx[off + 8]); Put(c, L"Rx_Status", status);
-                PutStr(c, L"Ioctl_Ver", &rx[off + 16], len - off - 16);
-                PutHex(c, L"Rx_Hex", rx, len < 96 ? len : 96);
-                got = TRUE;
-            } else {
-                others++;                                                          /* event/data frame: ignore */
-                Put(c, L"Rx_Other", others);
-                PutHex(c, L"Rx_Other_Hex", rx, 48);
-            }
-        } else {
-            LARGE_INTEGER t; t.QuadPart = -10 * 1000; KeDelayExecutionThread(KernelMode, FALSE, &t);
-        }
+        ServiceInts(c, sdBase, &got, &nIntr, &nFrames);
+        { LARGE_INTEGER t; t.QuadPart = -10 * 1000; KeDelayExecutionThread(KernelMode, FALSE, &t); }
     }
+    Put(c, L"Intr_Total", nIntr); Put(c, L"Frames_Total", nFrames);
     Put(c, L"Ioctl_Got", got ? 1 : 0);
+    st = BpRead32(c, sdBase + SD_INTSTATUS, &v);
+    Put(c, L"Int_End", v);
+
+    /* 4) what does the firmware say about it? */
+    { LARGE_INTEGER t; t.QuadPart = -10 * 1000 * 300; KeDelayExecutionThread(KernelMode, FALSE, &t); }
+    DumpShared(c);
     Put(c, L"Stage", got ? 59 : 56);
 }
 
