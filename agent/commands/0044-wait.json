@@ -1,0 +1,5 @@
+{
+ "action": "ps",
+ "timeout_sec": 120,
+ "script": "Start-Sleep -Seconds 75; 'waited'"
+}
