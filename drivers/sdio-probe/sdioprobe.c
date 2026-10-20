@@ -17,7 +17,15 @@
 #include <ntstrsafe.h>
 
 #define PROBE_TAG 'bPdS'
-#define PROBE_VERSION 10
+#define PROBE_VERSION 11
+
+typedef struct _AP_ENT {
+    UCHAR  Bssid[6];
+    UCHAR  SsidLen;
+    UCHAR  Ssid[32];
+    SHORT  Rssi;
+    USHORT Chanspec;
+} AP_ENT;
 
 typedef struct _DEV_CTX {
     PDEVICE_OBJECT           Self;
@@ -34,6 +42,19 @@ typedef struct _DEV_CTX {
     ULONG                    TxSeq;
     ULONG                    FrCount;
     ULONG                    MbCount;
+    ULONG                    SdBase;
+    PUCHAR                   RxBuf;        /* 2048 bytes: one received SDPCM frame */
+    ULONG                    ReqId;
+    BOOLEAN                  RepGot;
+    ULONG                    RepLen;
+    ULONG                    RepStatus;
+    UCHAR                    Rep[512];
+    ULONG                    NIntr;
+    ULONG                    NFrames;
+    ULONG                    NEvents;
+    BOOLEAN                  ScanDone;
+    ULONG                    ApCount;
+    AP_ENT                   Ap[24];
     ULONG                    CurWin;
     PUCHAR                   Bounce;       /* 512-byte non-paged bounce buffer for CMD53 bulk transfers */
     PMDL                     BounceMdl;
@@ -425,7 +446,7 @@ static VOID EromScan(_In_ PDEV_CTX c)
 #define RAMBASE_4345      0x198000UL
 #define RAM_CHUNK         64
 
-static NTSTATUS Cmd53Bounce(_In_ PDEV_CTX c, _In_ UCHAR fn, _In_ ULONG addr, _In_ ULONG len, _In_ BOOLEAN write)
+static NTSTATUS Cmd53Bounce(_In_ PDEV_CTX c, _In_ UCHAR fn, _In_ ULONG addr, _In_ ULONG len, _In_ BOOLEAN write, _In_ BOOLEAN inc)
 {
     static const SDCMD_DESCRIPTOR dRead  = { SDCMD_IO_RW_EXTENDED, SDCC_STANDARD, SDTD_READ,  SDTT_SINGLE_BLOCK, SDRT_5 };
     static const SDCMD_DESCRIPTOR dWrite = { SDCMD_IO_RW_EXTENDED, SDCC_STANDARD, SDTD_WRITE, SDTT_SINGLE_BLOCK, SDRT_5 };
@@ -436,7 +457,7 @@ static NTSTATUS Cmd53Bounce(_In_ PDEV_CTX c, _In_ UCHAR fn, _In_ ULONG addr, _In
     a.u.AsULONG = 0;
     a.u.bits.Function = fn;
     a.u.bits.Address  = addr;
-    a.u.bits.OpCode   = 1;
+    a.u.bits.OpCode   = inc ? 1 : 0;           /* 0 = fixed address (FIFO) */
     a.u.bits.BlockMode = 0;
     a.u.bits.WriteToDevice = write ? 1 : 0;
     a.u.bits.Count    = (len >= 512) ? 0 : len;
@@ -453,7 +474,7 @@ static NTSTATUS BpWrite32(_In_ PDEV_CTX c, _In_ ULONG addr, _In_ ULONG val)
     NTSTATUS st = BpSetWindow(c, addr);
     if (!NT_SUCCESS(st)) return st;
     *(PULONG)c->Bounce = val;
-    return Cmd53Bounce(c, c->Fn, (addr & 0x7FFF) | 0x8000, 4, TRUE);
+    return Cmd53Bounce(c, c->Fn, (addr & 0x7FFF) | 0x8000, 4, TRUE, TRUE);
 }
 
 static NTSTATUS RamWrite(_In_ PDEV_CTX c, _In_ ULONG addr, _In_reads_bytes_(len) const UCHAR *data, _In_ ULONG len)
@@ -466,7 +487,7 @@ static NTSTATUS RamWrite(_In_ PDEV_CTX c, _In_ ULONG addr, _In_reads_bytes_(len)
         st = BpSetWindow(c, addr);
         if (!NT_SUCCESS(st)) return st;
         RtlCopyMemory(c->Bounce, data, n);
-        st = Cmd53Bounce(c, c->Fn, off, n, TRUE);
+        st = Cmd53Bounce(c, c->Fn, off, n, TRUE, TRUE);
         if (!NT_SUCCESS(st)) return st;
         addr += n; data += n; len -= n;
     }
@@ -485,7 +506,7 @@ static NTSTATUS RamVerify(_In_ PDEV_CTX c, _In_ ULONG addr, _In_reads_bytes_(len
         if (n > RAM_CHUNK) n = RAM_CHUNK;
         st = BpSetWindow(c, a);
         if (!NT_SUCCESS(st)) return st;
-        st = Cmd53Bounce(c, c->Fn, off, n, FALSE);
+        st = Cmd53Bounce(c, c->Fn, off, n, FALSE, TRUE);
         if (!NT_SUCCESS(st)) return st;
         if (RtlCompareMemory(c->Bounce, data + done, n) != n) {
             ULONG k = (ULONG)RtlCompareMemory(c->Bounce, data + done, n);
@@ -637,7 +658,7 @@ static NTSTATUS RamRead(_In_ PDEV_CTX c, _In_ ULONG addr, _Out_writes_bytes_(len
         if (n > RAM_CHUNK) n = RAM_CHUNK;
         st = BpSetWindow(c, a);
         if (!NT_SUCCESS(st)) return st;
-        st = Cmd53Bounce(c, c->Fn, off, n, FALSE);
+        st = Cmd53Bounce(c, c->Fn, off, n, FALSE, TRUE);
         if (!NT_SUCCESS(st)) return st;
         RtlCopyMemory(out + done, c->Bounce, n);
         done += n;
@@ -859,14 +880,14 @@ static NTSTATUS F2Write(_In_ PDEV_CTX c, _In_reads_bytes_(len) const UCHAR *data
     NTSTATUS st = BpSetWindow(c, SI_ENUM_BASE);              /* F2 FIFO lives at chipcommon base, 4-byte access flag */
     if (!NT_SUCCESS(st)) return st;
     RtlCopyMemory(c->Bounce, data, len);
-    return Cmd53Bounce(c, 2, (SI_ENUM_BASE & 0x7FFF) | 0x8000, len, TRUE);
+    return Cmd53Bounce(c, 2, (SI_ENUM_BASE & 0x7FFF) | 0x8000, len, TRUE, TRUE);
 }
 
 static NTSTATUS F2Read(_In_ PDEV_CTX c, _Out_writes_bytes_(len) PUCHAR out, _In_ ULONG len)
 {
     NTSTATUS st = BpSetWindow(c, SI_ENUM_BASE);
     if (!NT_SUCCESS(st)) return st;
-    st = Cmd53Bounce(c, 2, (SI_ENUM_BASE & 0x7FFF) | 0x8000, len, FALSE);
+    st = Cmd53Bounce(c, 2, (SI_ENUM_BASE & 0x7FFF) | 0x8000, len, FALSE, FALSE);
     if (NT_SUCCESS(st)) RtlCopyMemory(out, c->Bounce, len);
     return st;
 }
@@ -875,106 +896,249 @@ static NTSTATUS F2Read(_In_ PDEV_CTX c, _Out_writes_bytes_(len) PUCHAR out, _In_
 #define SD_TOHOSTMAILBOXDATA 0x4C
 #define SMB_INT_ACK         0x2
 #define I_HMB_HOST_INT      0x80
+#define BRCMF_C_UP          2
+#define BRCMF_C_SET_VAR     263
+#define BRCMF_E_ESCAN_RESULT 69
+#define RX_BUF_SIZE         2048
 
-/* Port of the essential parts of brcmf_sdio_dpc(): clear intstatus, ack the mailbox, read frames. */
-static VOID ServiceInts(_In_ PDEV_CTX c, _In_ ULONG sdBase, _Inout_ PBOOLEAN got, _Inout_ PULONG nIntr, _Inout_ PULONG nFrames)
+static ULONG Be32(const UCHAR *p) { return ((ULONG)p[0] << 24) | ((ULONG)p[1] << 16) | ((ULONG)p[2] << 8) | p[3]; }
+static ULONG Le32(const UCHAR *p) { return p[0] | ((ULONG)p[1] << 8) | ((ULONG)p[2] << 16) | ((ULONG)p[3] << 24); }
+static USHORT Le16(const UCHAR *p) { return (USHORT)(p[0] | (p[1] << 8)); }
+
+static VOID HandleEvent(_In_ PDEV_CTX c, _In_reads_bytes_(plen) const UCHAR *p, _In_ ULONG plen)
 {
-    ULONG v = 0, clear, mb = 0;
-    UCHAR rx[512];
-    NTSTATUS st = BpRead32(c, sdBase + SD_INTSTATUS, &v);
-    if (!NT_SUCCESS(st)) return;
-    clear = v & HOSTINTMASK_VAL;
-    if (clear == 0) return;
-    (*nIntr)++;
-    if (*nIntr <= 4) { WCHAR n[16]; if (NT_SUCCESS(RtlStringCchPrintfW(n, 16, L"Int_%u", *nIntr))) Put(c, n, v); }
-    (VOID)BpWrite32(c, sdBase + SD_INTSTATUS, clear);                 /* write-1-to-clear */
+    ULONG type, status, dlen;
+    const UCHAR *d;
 
-    if (v & I_HMB_HOST_INT) {                                         /* mailbox from the firmware */
-        st = BpRead32(c, sdBase + SD_TOHOSTMAILBOXDATA, &mb);
-        (VOID)BpWrite32(c, sdBase + SD_TOSBMAILBOX, SMB_INT_ACK);     /* ack */
-        Put(c, L"Mbx_Data", mb);
-        Put(c, L"Mbx_Seen", 1);
-        if (c->MbCount < 6) { WCHAR n[16]; if (NT_SUCCESS(RtlStringCchPrintfW(n, 16, L"Mb%u", c->MbCount))) Put(c, n, mb); }
-        c->MbCount++;
-    }
-    if (v & I_HMB_FRAME_IND) {
-        ULONG len, cs, sw, chan, off;
-        st = F2Read(c, rx, 64);
-        if (!NT_SUCCESS(st)) { Put(c, L"F2Rx_Err", (ULONG)st); return; }
-        (*nFrames)++;
-        if (c->FrCount < 6) { WCHAR n[16]; if (NT_SUCCESS(RtlStringCchPrintfW(n, 16, L"Fr%u_Hex", c->FrCount))) PutHex(c, n, rx, 32); }
-        c->FrCount++;
-        len = *(PUSHORT)&rx[0]; cs = *(PUSHORT)&rx[2];
-        sw = *(PULONG)&rx[4];
-        chan = (sw >> 8) & 0xF; off = sw >> 24;
-        if (((len ^ cs) & 0xFFFF) != 0xFFFF || len < 12 || len > 512) { PutHex(c, L"Rx_BadHex", rx, 64); return; }
-        if (len > 64) {
-            st = F2Read(c, rx + 64, (len - 64 + 3) & ~3UL);
-            if (!NT_SUCCESS(st)) { Put(c, L"F2Rx2_Err", (ULONG)st); return; }
-        }
-        if (len == 12) {                                              /* header-only: flow control / credits */
-            Put(c, L"Fc_MaxSeq", (*(PULONG)&rx[8] >> 8) & 0xFF);
-            return;
-        }
-        Put(c, L"Rx_Len", len); Put(c, L"Rx_Chan", chan); Put(c, L"Rx_Off", off);
-        if (chan == 0 && off >= 12 && off + 16 <= len) {
-            Put(c, L"Rx_Cmd", *(PULONG)&rx[off]); Put(c, L"Rx_Flags", *(PULONG)&rx[off + 8]); Put(c, L"Rx_Status", *(PULONG)&rx[off + 12]);
-            PutStr(c, L"Ioctl_Ver", &rx[off + 16], len - off - 16);
-            PutHex(c, L"Rx_Hex", rx, len < 96 ? len : 96);
-            *got = TRUE;
-        } else {
-            Put(c, L"Rx_Other", *nFrames);
-            PutHex(c, L"Rx_Other_Hex", rx, 48);
+    if (plen < 14 + 10 + 48) return;                               /* eth + brcm hdr + event msg */
+    type = Be32(p + 28); status = Be32(p + 32); dlen = Be32(p + 44);
+    d = p + 72;
+    if (c->NEvents < 12) { WCHAR n[16]; if (NT_SUCCESS(RtlStringCchPrintfW(n, 16, L"Ev%u", c->NEvents))) Put(c, n, (type << 8) | (status & 0xFF)); }
+    c->NEvents++;
+    if (type != BRCMF_E_ESCAN_RESULT) return;
+    if (status == 0) c->ScanDone = TRUE;                           /* BRCMF_E_STATUS_SUCCESS: scan finished */
+    if (dlen < 12 || 72 + dlen > plen) return;
+    {
+        ULONG cnt = Le16(d + 10), i, off = 12;
+        for (i = 0; i < cnt && i < 4; i++) {
+            const UCHAR *bss = d + off;
+            ULONG blen, k;
+            AP_ENT *ap;
+            if (off + 82 > dlen) break;
+            blen = Le32(bss + 4);
+            if (blen < 82 || off + blen > dlen) break;
+            for (k = 0; k < c->ApCount; k++) if (RtlCompareMemory(c->Ap[k].Bssid, bss + 8, 6) == 6) break;
+            if (k < RTL_NUMBER_OF(c->Ap)) {
+                ap = &c->Ap[k];
+                RtlCopyMemory(ap->Bssid, bss + 8, 6);
+                ap->SsidLen = bss[18] > 32 ? 32 : bss[18];
+                RtlCopyMemory(ap->Ssid, bss + 19, ap->SsidLen);
+                ap->Chanspec = Le16(bss + 72);
+                ap->Rssi = (SHORT)Le16(bss + 78);
+                if (k == c->ApCount) c->ApCount++;
+            }
+            off += blen;
         }
     }
 }
 
-/* Build + send one "ver" GET_VAR control frame. Variants (to find what the firmware accepts):
- *   0: hw len = 156 (unpadded), send 160     (Linux: hd_info.len = len - pad)
- *   1: hw len = 160 (padded),   send 160
- *   2: hw len = 156,            send 156 (no pad)
- *   3: like 0 but CCCR interrupt-enable (IEN) bits set first
- *   4: like 0 with a 64-byte output buffer
- */
-static NTSTATUS SendVer(_In_ PDEV_CTX c, _In_ ULONG variant)
+/* Port of the essential parts of brcmf_sdio_dpc(): clear intstatus, ack the mailbox, read + dispatch frames. */
+static VOID ServiceInts(_In_ PDEV_CTX c)
 {
-    UCHAR frame[192], b = 0;
-    ULONG datalen = (variant == 4) ? 64 : 128;
-    ULONG total = 12 + 16 + datalen;
-    ULONG sendlen = (total + 7) & ~7UL;
-    ULONG hwlen = total;
+    ULONG v = 0, clear, mb = 0, sdBase = c->SdBase;
+    PUCHAR rx = c->RxBuf;
+    NTSTATUS st = BpRead32(c, sdBase + SD_INTSTATUS, &v);
+    if (!NT_SUCCESS(st)) return;
+    clear = v & HOSTINTMASK_VAL;
+    if (clear == 0) return;
+    c->NIntr++;
+    (VOID)BpWrite32(c, sdBase + SD_INTSTATUS, clear);                 /* write-1-to-clear */
 
-    if (variant == 1) hwlen = sendlen;
-    if (variant == 2) sendlen = total;
-    if (variant == 3) (VOID)Cmd52(c, 0, 0x04, TRUE, 0x07, &b);          /* IEN: master + F1 + F2 */
+    if (v & I_HMB_HOST_INT) {
+        st = BpRead32(c, sdBase + SD_TOHOSTMAILBOXDATA, &mb);
+        (VOID)BpWrite32(c, sdBase + SD_TOSBMAILBOX, SMB_INT_ACK);
+        if (c->MbCount < 6) { WCHAR n[16]; if (NT_SUCCESS(RtlStringCchPrintfW(n, 16, L"Mb%u", c->MbCount))) Put(c, n, mb); }
+        c->MbCount++;
+    }
+    if (v & I_HMB_FRAME_IND) {
+        ULONG len, cs, sw, chan, off, done;
+        st = F2Read(c, rx, 64);
+        if (!NT_SUCCESS(st)) { Put(c, L"F2Rx_Err", (ULONG)st); return; }
+        c->NFrames++;
+        len = Le16(rx); cs = Le16(rx + 2); sw = Le32(rx + 4);
+        chan = (sw >> 8) & 0xF; off = sw >> 24;
+        if (((len ^ cs) & 0xFFFF) != 0xFFFF || len < 12 || len > RX_BUF_SIZE) { PutHex(c, L"Rx_BadHex", rx, 64); return; }
+        done = 64;
+        while (done < len) {                                          /* rest of the frame, <=512 bytes per CMD53 */
+            ULONG n = len - done;
+            if (n > 512) n = 512;
+            n = (n + 3) & ~3UL;
+            if (done + n > RX_BUF_SIZE) break;
+            st = F2Read(c, rx + done, n);
+            if (!NT_SUCCESS(st)) { Put(c, L"F2Rx2_Err", (ULONG)st); return; }
+            done += n;
+        }
+        if (len == 12) return;                                        /* credit-only frame */
+        if (chan == 0) {                                              /* control reply */
+            if (off >= 12 && off + 16 <= len) {
+                ULONG flags = Le32(rx + off + 8);
+                if ((flags >> 16) == (c->ReqId & 0xFFFF)) {
+                    ULONG n = len - off - 16;
+                    if (n > sizeof(c->Rep)) n = sizeof(c->Rep);
+                    c->RepStatus = Le32(rx + off + 12);
+                    c->RepLen = n;
+                    RtlCopyMemory(c->Rep, rx + off + 16, n);
+                    c->RepGot = TRUE;
+                }
+            }
+        } else if (chan == 1) {                                       /* firmware event: BCDC hdr(4) + 4*data_offset + eth frame */
+            if (off + 4 <= len) {
+                ULONG pl = off + 4 + (ULONG)rx[off + 3] * 4;
+                if (pl < len) HandleEvent(c, rx + pl, len - pl);
+            }
+        }
+    }
+}
 
-    RtlZeroMemory(frame, sizeof(frame));
-    *(PUSHORT)&frame[0] = (USHORT)hwlen;
-    *(PUSHORT)&frame[2] = (USHORT)~hwlen;
+static VOID Delay1ms(VOID) { LARGE_INTEGER t; t.QuadPart = -10 * 1000; KeDelayExecutionThread(KernelMode, FALSE, &t); }
+
+/* One control-channel request/response. SET: payload = name\0 + data. GET: payload = name\0 (zero padded to outlen). */
+static NTSTATUS CtlCall(_In_ PDEV_CTX c, _In_ ULONG cmd, _In_ BOOLEAN set, _In_reads_bytes_opt_(plen) const UCHAR *payload, _In_ ULONG plen, _In_ ULONG outlen, _In_ ULONG timeoutMs)
+{
+    UCHAR frame[512];
+    ULONG dlen = set ? plen : (outlen > plen ? outlen : plen);
+    ULONG total = 28 + dlen, sendlen, ms;
+    NTSTATUS st;
+
+    if (total > 504) return STATUS_BUFFER_TOO_SMALL;
+    sendlen = (total + 7) & ~7UL;
+    RtlZeroMemory(frame, sendlen);
+    c->ReqId = (c->ReqId + 1) & 0xFFFF;
+    *(PUSHORT)&frame[0] = (USHORT)sendlen;                           /* hw length = padded length (what the firmware accepted) */
+    *(PUSHORT)&frame[2] = (USHORT)~sendlen;
     *(PULONG)&frame[4]  = (c->TxSeq & 0xFF) | (0UL << 8) | (12UL << 24);
     *(PULONG)&frame[8]  = 0;
-    *(PULONG)&frame[12] = BRCMF_C_GET_VAR;
-    *(PULONG)&frame[16] = datalen;
-    *(PULONG)&frame[20] = (0x1234UL + variant) << 16;
+    *(PULONG)&frame[12] = cmd;
+    *(PULONG)&frame[16] = dlen;
+    *(PULONG)&frame[20] = (c->ReqId << 16) | (set ? 2UL : 0UL);
     *(PULONG)&frame[24] = 0;
-    RtlCopyMemory(&frame[28], "ver", 4);
+    if (plen != 0 && payload != NULL) RtlCopyMemory(&frame[28], payload, plen);
+    c->RepGot = FALSE; c->RepLen = 0; c->RepStatus = 0;
+    st = F2Write(c, frame, sendlen);
+    if (!NT_SUCCESS(st)) return st;
     c->TxSeq = (c->TxSeq + 1) & 0xFF;
-    return F2Write(c, frame, sendlen);
+    for (ms = 0; ms < timeoutMs && !c->RepGot; ms++) { ServiceInts(c); if (!c->RepGot) Delay1ms(); }
+    if (!c->RepGot) return STATUS_TIMEOUT;
+    return (c->RepStatus == 0) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
+/* name\0 + data -> payload buffer; returns length */
+static ULONG BuildVar(_Out_writes_bytes_(cap) PUCHAR out, _In_ ULONG cap, _In_ const char *name, _In_reads_bytes_opt_(dlen) const UCHAR *data, _In_ ULONG dlen)
+{
+    ULONG n = 0;
+    while (name[n] != 0 && n + 1 < cap) { out[n] = (UCHAR)name[n]; n++; }
+    out[n++] = 0;
+    if (data != NULL && n + dlen <= cap) { RtlCopyMemory(out + n, data, dlen); n += dlen; }
+    return n;
+}
+
+static NTSTATUS VarGet(_In_ PDEV_CTX c, _In_ const char *name, _In_ ULONG outlen)
+{
+    UCHAR pl[64];
+    ULONG n = BuildVar(pl, sizeof(pl), name, NULL, 0);
+    return CtlCall(c, 262 /* GET_VAR */, FALSE, pl, n, outlen, 2000);
+}
+
+static NTSTATUS VarSet(_In_ PDEV_CTX c, _In_ const char *name, _In_reads_bytes_(dlen) const UCHAR *data, _In_ ULONG dlen)
+{
+    UCHAR pl[500];
+    ULONG n = BuildVar(pl, sizeof(pl), name, data, dlen);
+    return CtlCall(c, BRCMF_C_SET_VAR, TRUE, pl, n, 0, 3000);
+}
+
+static VOID LoadClm(_In_ PDEV_CTX c)
+{
+    PUCHAR clm = NULL;
+    ULONG clmLen = 0, pos = 0, chunks = 0;
+    NTSTATUS st;
+    UCHAR buf[12 + 384];
+
+    Put(c, L"Stage", 62);
+    st = ReadFileAll(L"\\??\\C:\\rpiwin\\fw\\brcmfmac43456-sdio.clm_blob", &clm, &clmLen);
+    PutStep(c, L"Clm_Read_St", st, L"Clm_Len", clmLen);
+    if (!NT_SUCCESS(st)) return;
+    while (pos < clmLen) {
+        ULONG n = clmLen - pos, flag = (1UL << 12);                  /* DLOAD_HANDLER_VER << 12 */
+        if (n > 384) n = 384;
+        if (pos == 0) flag |= 0x2;                                    /* DL_BEGIN */
+        if (pos + n >= clmLen) flag |= 0x4;                           /* DL_END   */
+        RtlZeroMemory(buf, 12);
+        *(PUSHORT)&buf[0] = (USHORT)flag;
+        *(PUSHORT)&buf[2] = 2;                                        /* DL_TYPE_CLM */
+        *(PULONG)&buf[4]  = n;
+        *(PULONG)&buf[8]  = 0;                                        /* crc */
+        RtlCopyMemory(&buf[12], clm + pos, n);
+        st = VarSet(c, "clmload", buf, 12 + n);
+        if (!NT_SUCCESS(st)) { PutStep(c, L"Clm_Chunk_St", st, L"Clm_Chunk_At", pos); break; }
+        pos += n; chunks++;
+    }
+    Put(c, L"Clm_Chunks", chunks);
+    if (pos >= clmLen) {
+        st = VarGet(c, "clmload_status", 4);
+        PutStep(c, L"Clm_Status_St", st, L"Clm_Status", c->RepLen >= 4 ? Le32(c->Rep) : 0xFFFFFFFF);
+    }
+    ExFreePoolWithTag(clm, PROBE_TAG);
+}
+
+static VOID RunScan(_In_ PDEV_CTX c)
+{
+    UCHAR p[8 + 64 + 2];
+    ULONG i, ms;
+    NTSTATUS st;
+
+    Put(c, L"Stage", 66);
+    RtlZeroMemory(p, sizeof(p));
+    *(PULONG)&p[0]  = 1;                                              /* BRCMF_ESCAN_REQ_VERSION */
+    *(PUSHORT)&p[4] = 1;                                              /* WL_ESCAN_ACTION_START   */
+    *(PUSHORT)&p[6] = 0x1234;                                         /* sync id */
+    /* brcmf_scan_params_le @8: ssid{len=0,ssid[32]} (36) | bssid[6] | bss_type | scan_type | nprobes | active | passive | home | channel_num */
+    for (i = 0; i < 6; i++) p[8 + 36 + i] = 0xFF;                     /* broadcast bssid */
+    p[8 + 42] = 2;                                                    /* DOT11_BSSTYPE_ANY */
+    p[8 + 43] = 0;                                                    /* BRCMF_SCANTYPE_ACTIVE */
+    *(PULONG)&p[8 + 44] = 0xFFFFFFFF;                                 /* nprobes     (-1) */
+    *(PULONG)&p[8 + 48] = 0xFFFFFFFF;                                 /* active_time (-1) */
+    *(PULONG)&p[8 + 52] = 0xFFFFFFFF;                                 /* passive_time(-1) */
+    *(PULONG)&p[8 + 56] = 0xFFFFFFFF;                                 /* home_time   (-1) */
+    *(PULONG)&p[8 + 60] = 0;                                          /* channel_num */
+    c->ScanDone = FALSE; c->ApCount = 0;
+    st = VarSet(c, "escan", p, sizeof(p));
+    PutStep(c, L"Escan_St", st, L"Escan_Status", c->RepStatus);
+    if (!NT_SUCCESS(st)) return;
+    for (ms = 0; ms < 12000 && !c->ScanDone; ms++) { ServiceInts(c); if (!c->ScanDone) Delay1ms(); }
+    Put(c, L"Scan_Done", c->ScanDone ? 1 : 0);
+    Put(c, L"Scan_Ms", ms);
+    Put(c, L"Ap_N", c->ApCount);
+    for (i = 0; i < c->ApCount && i < 16; i++) {
+        WCHAR n[24];
+        if (NT_SUCCESS(RtlStringCchPrintfW(n, 24, L"Ap%u_Ssid", i)))  PutStr(c, n, c->Ap[i].Ssid, c->Ap[i].SsidLen);
+        if (NT_SUCCESS(RtlStringCchPrintfW(n, 24, L"Ap%u_Bssid", i))) PutHex(c, n, c->Ap[i].Bssid, 6);
+        if (NT_SUCCESS(RtlStringCchPrintfW(n, 24, L"Ap%u_Rssi", i)))  Put(c, n, (ULONG)(LONG)c->Ap[i].Rssi);
+        if (NT_SUCCESS(RtlStringCchPrintfW(n, 24, L"Ap%u_Chan", i)))  Put(c, n, c->Ap[i].Chanspec);
+    }
 }
 
 static VOID Ioctl4b(_In_ PDEV_CTX c)
 {
     NTSTATUS st;
     UCHAR b = 0, rdy = 0;
-    ULONG sdBase = 0, sdWrap = 0, v = 0, i, variant, nIntr = 0, nFrames = 0, ms;
-    BOOLEAN got = FALSE;
+    ULONG sdWrap = 0, i, scan = 0;
 
     Put(c, L"Stage", 50);
-    c->FrCount = 0; c->MbCount = 0;
-    if (!FindCore(c, CORE_SDIODEV, 0, &sdBase, &sdWrap)) { Put(c, L"F2_Cores", 0); return; }
+    c->FrCount = 0; c->MbCount = 0; c->NIntr = 0; c->NFrames = 0; c->NEvents = 0; c->ReqId = 0x100;
+    if (!FindCore(c, CORE_SDIODEV, 0, &c->SdBase, &sdWrap)) { Put(c, L"F2_Cores", 0); return; }
 
     (VOID)Cmd52(c, c->Fn, F1_SLEEPCSR, TRUE, 0x01, &b);               /* KSO */
-    st = BpWrite32(c, sdBase + SD_TOSBMAILBOXDATA, 4UL << 16);       /* host protocol version 4 */
+    st = BpWrite32(c, c->SdBase + SD_TOSBMAILBOXDATA, 4UL << 16);    /* host protocol version 4 */
     PutStep(c, L"F2_Mbx_St", st, L"F2_Mbx_Val", 4UL << 16);
 
     st = Cmd52(c, 0, 0x02, FALSE, 0, &b);
@@ -990,41 +1154,47 @@ static VOID Ioctl4b(_In_ PDEV_CTX c)
 
     (VOID)Cmd52(c, 0, 0x210, TRUE, 0x00, &b);                         /* F2 block size 512 */
     (VOID)Cmd52(c, 0, 0x211, TRUE, 0x02, &b);
-    st = BpWrite32(c, sdBase + SD_HOSTINTMASK, HOSTINTMASK_VAL);
+    st = BpWrite32(c, c->SdBase + SD_HOSTINTMASK, HOSTINTMASK_VAL);
     PutStep(c, L"F2_Mask_St", st, L"F2_Mask_Val", HOSTINTMASK_VAL);
     st = Cmd52(c, c->Fn, F1_WATERMARK, TRUE, 0x08, &b);
     PutStep(c, L"F2_Wm_St", st, L"F2_Wm_Val", 0x08);
 
     Put(c, L"Stage", 51);                                              /* service what the firmware already posted */
-    for (i = 0; i < 300; i++) {
-        ServiceInts(c, sdBase, &got, &nIntr, &nFrames);
-        { LARGE_INTEGER t; t.QuadPart = -10 * 1000; KeDelayExecutionThread(KernelMode, FALSE, &t); }
-    }
-    Put(c, L"Pre_Intr", nIntr); Put(c, L"Pre_Frames", nFrames);
+    for (i = 0; i < 300; i++) { ServiceInts(c); Delay1ms(); }
+    Put(c, L"Pre_Intr", c->NIntr); Put(c, L"Pre_Frames", c->NFrames);
 
-    for (variant = 0; variant < 5 && !got; variant++) {
-        ULONG f0 = nFrames, i0 = nIntr;
-        WCHAR n[24];
-        Put(c, L"Stage", 52 + variant);
-        st = SendVer(c, variant);
-        if (NT_SUCCESS(RtlStringCchPrintfW(n, 24, L"V%u_Tx_St", variant))) Put(c, n, (ULONG)st);
-        if (!NT_SUCCESS(st)) break;
-        for (ms = 0; ms < 900 && !got; ms++) {
-            ServiceInts(c, sdBase, &got, &nIntr, &nFrames);
-            { LARGE_INTEGER t; t.QuadPart = -10 * 1000; KeDelayExecutionThread(KernelMode, FALSE, &t); }
+    Put(c, L"Stage", 60);
+    st = VarGet(c, "ver", 128);
+    PutStep(c, L"Ver_St", st, L"Ver_Len", c->RepLen);
+    if (c->RepLen != 0) PutStr(c, L"Ioctl_Ver", c->Rep, c->RepLen);
+    if (!NT_SUCCESS(st)) { Put(c, L"Stage", 61); return; }
+
+    if (GetU32(c, L"Scan", &scan) && scan == 1) {
+        Put(c, L"Scan", 0);                                            /* one-shot */
+        LoadClm(c);
+
+        st = VarGet(c, "cur_etheraddr", 6);
+        PutStep(c, L"Mac_St", st, L"Mac_Len", c->RepLen);
+        if (c->RepLen >= 6) PutHex(c, L"Mac", c->Rep, 6);
+
+        {   UCHAR mask[18];                                            /* event_msgs: only E_ESCAN_RESULT (69) */
+            RtlZeroMemory(mask, sizeof(mask));
+            mask[BRCMF_E_ESCAN_RESULT / 8] |= (UCHAR)(1u << (BRCMF_E_ESCAN_RESULT % 8));
+            st = VarSet(c, "event_msgs", mask, sizeof(mask));
+            PutStep(c, L"EvMask_St", st, L"EvMask_Status", c->RepStatus);
         }
-        if (NT_SUCCESS(RtlStringCchPrintfW(n, 24, L"V%u_Frames", variant))) Put(c, n, nFrames - f0);
-        if (NT_SUCCESS(RtlStringCchPrintfW(n, 24, L"V%u_Intr", variant)))   Put(c, n, nIntr - i0);
-        if (got) Put(c, L"Ioctl_Variant", variant);
-    }
-    Put(c, L"Intr_Total", nIntr); Put(c, L"Frames_Total", nFrames);
-    Put(c, L"Ioctl_Got", got ? 1 : 0);
-    st = BpRead32(c, sdBase + SD_INTSTATUS, &v);
-    Put(c, L"Int_End", v);
 
+        st = CtlCall(c, BRCMF_C_UP, TRUE, NULL, 0, 0, 3000);
+        PutStep(c, L"Up_St", st, L"Up_Status", c->RepStatus);
+
+        RunScan(c);
+        Put(c, L"Ev_Total", c->NEvents);
+    }
+
+    Put(c, L"Intr_Total", c->NIntr); Put(c, L"Frames_Total", c->NFrames);
     { LARGE_INTEGER t; t.QuadPart = -10 * 1000 * 300; KeDelayExecutionThread(KernelMode, FALSE, &t); }
     DumpShared(c);
-    Put(c, L"Stage", got ? 59 : 56);
+    Put(c, L"Stage", 59);
 }
 
 static VOID RunProbe(_In_ PDEV_CTX Ctx)
@@ -1203,16 +1373,18 @@ static VOID DoProbe(_In_ PDEV_CTX ctx)
         ctx->XferMdl = IoAllocateMdl(ctx->XferBuf, sizeof(ULONG), FALSE, FALSE, NULL);
         if (ctx->XferMdl != NULL) MmBuildMdlForNonPagedPool(ctx->XferMdl);
     }
+    ctx->RxBuf = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, RX_BUF_SIZE, PROBE_TAG);
     ctx->Bounce = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, 512, PROBE_TAG);
     if (ctx->Bounce != NULL) {
         ctx->BounceMdl = IoAllocateMdl(ctx->Bounce, 512, FALSE, FALSE, NULL);
         if (ctx->BounceMdl != NULL) MmBuildMdlForNonPagedPool(ctx->BounceMdl);
     }
-    if (ctx->XferBuf != NULL && ctx->XferMdl != NULL && ctx->Bounce != NULL && ctx->BounceMdl != NULL) {
+    if (ctx->XferBuf != NULL && ctx->XferMdl != NULL && ctx->Bounce != NULL && ctx->BounceMdl != NULL && ctx->RxBuf != NULL) {
         RunProbe(ctx);
     } else {
         Put(ctx, L"Probe_Done", 0xFFFFFFFF);
     }
+    if (ctx->RxBuf != NULL) { ExFreePoolWithTag(ctx->RxBuf, PROBE_TAG); ctx->RxBuf = NULL; }
     if (ctx->BounceMdl != NULL) { IoFreeMdl(ctx->BounceMdl); ctx->BounceMdl = NULL; }
     if (ctx->Bounce != NULL) { ExFreePoolWithTag(ctx->Bounce, PROBE_TAG); ctx->Bounce = NULL; }
     if (ctx->XferMdl != NULL) { IoFreeMdl(ctx->XferMdl); ctx->XferMdl = NULL; }
