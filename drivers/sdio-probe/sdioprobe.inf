@@ -30,17 +30,17 @@ sdioprobe.sys = 1,,
 CopyFiles=Drivers_Dir
 
 [Drivers_Dir]
-sdioprobe.sys
+sdioprobe2.sys,sdioprobe.sys
 
 [SdioProbe_Device.NT.Services]
-AddService=sdioprobe,%SPSVCINST_ASSOCSERVICE%,SdioProbe_Service_Inst
+AddService=sdioprobe2,%SPSVCINST_ASSOCSERVICE%,SdioProbe_Service_Inst
 
 [SdioProbe_Service_Inst]
 DisplayName    = %DeviceDesc%
 ServiceType    = 1
 StartType      = 3
 ErrorControl   = 1
-ServiceBinary  = %13%\sdioprobe.sys
+ServiceBinary  = %13%\sdioprobe2.sys
 
 [Strings]
 SPSVCINST_ASSOCSERVICE = 0x00000002

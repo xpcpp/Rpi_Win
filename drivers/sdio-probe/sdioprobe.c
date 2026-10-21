@@ -17,7 +17,7 @@
 #include <ntstrsafe.h>
 
 #define PROBE_TAG 'bPdS'
-#define PROBE_VERSION 11
+#define PROBE_VERSION 12
 
 typedef struct _AP_ENT {
     UCHAR  Bssid[6];
@@ -71,6 +71,7 @@ typedef struct _DEV_CTX {
 
 DRIVER_INITIALIZE   DriverEntry;
 DRIVER_ADD_DEVICE   AddDevice;
+DRIVER_UNLOAD       DriverUnloadRoutine;
 DRIVER_DISPATCH     DispatchPnp;
 DRIVER_DISPATCH     DispatchPower;
 DRIVER_DISPATCH     DispatchPass;
@@ -1560,6 +1561,11 @@ NTSTATUS AddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Physica
     return STATUS_SUCCESS;
 }
 
+VOID DriverUnloadRoutine(_In_ PDRIVER_OBJECT DriverObject)
+{
+    UNREFERENCED_PARAMETER(DriverObject);     /* having an unload routine lets Windows unload the image when the last device goes away */
+}
+
 NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
 {
     ULONG i;
@@ -1569,5 +1575,6 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
     DriverObject->MajorFunction[IRP_MJ_PNP]   = DispatchPnp;
     DriverObject->MajorFunction[IRP_MJ_POWER] = DispatchPower;
     DriverObject->DriverExtension->AddDevice = AddDevice;
+    DriverObject->DriverUnload = DriverUnloadRoutine;
     return STATUS_SUCCESS;
 }
