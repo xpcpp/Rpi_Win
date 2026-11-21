@@ -1,0 +1,5 @@
+{
+ "action": "ps",
+ "timeout_sec": 120,
+ "script": "$d = Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like 'SD\\VID_02D0&PID_A9A6&FN_1*' } | Select-Object -First 1\n$root = 'HKLM:\\SYSTEM\\CurrentControlSet\\Enum\\SD\\VID_02D0&PID_A9A6&FN_1'\nforeach ($i in Get-ChildItem $root) {\n  $k = Join-Path $i.PSPath 'Device Parameters'\n  Set-ItemProperty $k -Name BootFw -Value 1 -Type DWord\n  Set-ItemProperty $k -Name Ioctl -Value 1 -Type DWord\n  Set-ItemProperty $k -Name Scan -Value 1 -Type DWord\n  Set-ItemProperty $k -Name ProbeState -Value 0 -Type DWord\n  \"armed BootFw+Ioctl+Scan\"\n}\n(pnputil /restart-device $d.InstanceId | Out-String)"
+}

@@ -1,0 +1,5 @@
+{
+ "action": "ps",
+ "timeout_sec": 120,
+ "script": "Start-Sleep -Seconds 20\n$d = Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like 'SD\\VID_02D0&PID_A9A6&FN_1*' } | Select-Object -First 1\n\"FN_1: status=\" + $d.Status + \" name=\" + $d.FriendlyName\n\"service=\" + (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName DEVPKEY_Device_Service).Data\n\"inf=\" + (Get-PnpDeviceProperty -InstanceId $d.InstanceId -KeyName DEVPKEY_Device_DriverInfPath).Data\n$root = 'HKLM:\\SYSTEM\\CurrentControlSet\\Enum\\SD\\VID_02D0&PID_A9A6&FN_1'\n$k = Get-ChildItem $root | ForEach-Object { Join-Path $_.PSPath 'Device Parameters' } | Select-Object -First 1\n\"probe Ver=\" + (Get-ItemProperty $k).Ver"
+}

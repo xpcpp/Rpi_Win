@@ -110,8 +110,8 @@ function Handle-Action($cmd) {
       $only = if ($cmd.only -in 'all','sdhc','sdiofn') { $cmd.only } else { 'sdiofn' }
       return Run-PiTest 'Install' @('-Only', $only, '-Yes')
     }
-    'disable-probe' { return ((sc.exe config sdioprobe start= disabled; sc.exe config sdioprobe2 start= disabled) | Out-String) }
-    'enable-probe'  { return ((sc.exe config sdioprobe start= demand; sc.exe config sdioprobe2 start= demand) | Out-String) }
+    'disable-probe' { return ($(sc.exe config sdioprobe start= disabled; sc.exe config sdioprobe2 start= disabled) | Out-String) }
+    'enable-probe'  { return ($(sc.exe config sdioprobe start= demand; sc.exe config sdioprobe2 start= demand) | Out-String) }
     'ps'            { return Run-DevPs $cmd }
     'reboot'        { return 'REBOOT' }
     default         { return "refused: action '$($cmd.action)' is not allow-listed" }
@@ -134,7 +134,7 @@ function Send-BootReportIfNeeded {
   $report = ''
   $bc = Get-WinEvent -FilterHashtable @{LogName='System'; Id=1001; StartTime=(Get-Date).AddMinutes(-15)} -ErrorAction SilentlyContinue
   if ($bc) {
-    $svc = ((sc.exe qc sdioprobe2 2>&1) + (sc.exe qc sdioprobe 2>&1) | Out-String)
+    $svc = (@(sc.exe qc sdioprobe2 2>&1) + @(sc.exe qc sdioprobe 2>&1) | Out-String)
     if ($svc -notmatch 'DISABLED') {
       sc.exe config sdioprobe start= disabled | Out-Null
       sc.exe config sdioprobe2 start= disabled | Out-Null
