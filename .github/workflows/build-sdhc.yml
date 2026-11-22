@@ -177,7 +177,7 @@ jobs:
           $cert = New-SelfSignedCertificate -Type CodeSigningCert `
             -Subject "CN=Rpi_Win CI test signing run $env:GITHUB_RUN_ID" `
             -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
-            -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(30)
+            -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(3)
           Export-Certificate -Cert $cert -FilePath dist\rpi_win_ci_signing.cer | Out-Null
           $kits = "${env:ProgramFiles(x86)}\Windows Kits\10\bin\$env:KIT_BUILD"
           $signtool = "$kits\x64\signtool.exe"
